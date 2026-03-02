@@ -14,6 +14,10 @@ pub enum TurnstileTracerError {
 	Socketpair(std::io::Error),
 	#[error("failed to spawn child process: {0}")]
 	Spawn(std::io::Error),
+	#[error("failed to resolve syscall {0}: {1}")]
+	ResolveSyscall(&'static str, libseccomp::error::SeccompError),
+	#[error("failed to add filter rule for {0}: {1}")]
+	AddRule(&'static str, libseccomp::error::SeccompError),
 }
 
 #[derive(Error, Debug)]
@@ -28,4 +32,10 @@ pub enum AccessRequestError {
 	SendError(libseccomp::error::SeccompError),
 	#[error("failed to check seccomp_notify_id_valid(): {0}")]
 	NotifyIdValid(libseccomp::error::SeccompError),
+	#[error("Open /proc/{0}/mem failed: {1}")]
+	ReadProcessMemory(u32, std::io::Error),
+	#[error("Traced process issued invalid syscall: {0}")]
+	InvalidSyscallData(&'static str),
+	#[error("Failed to open {0}: {1}")]
+	OpenFd(String, std::io::Error),
 }

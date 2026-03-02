@@ -12,7 +12,7 @@ use crate::{AccessRequestError, tracer};
 /// not exist yet).
 #[derive(Debug)]
 pub struct AccessRequest {
-	operations: Vec<Operation>,
+	pub(crate) operations: Vec<Operation>,
 }
 
 #[derive(Debug)]

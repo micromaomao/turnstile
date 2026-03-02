@@ -1,11 +1,17 @@
-use std::io;
+use std::{
+	ffi::{CStr, CString},
+	io,
+};
 
-use libseccomp::{ScmpFd, ScmpFilterContext, ScmpNotifData, ScmpNotifReq};
+use libc::FS;
+use libseccomp::{ScmpFd, ScmpFilterContext, ScmpNotifData, ScmpNotifReq, ScmpSyscall};
 
 use crate::{
 	AccessRequest, AccessRequestError, Operation, TurnstileTracer, TurnstileTracerError,
 	syscalls::RequestContext,
 };
+
+use log::warn;
 
 #[derive(Debug)]
 pub(crate) struct ForeignFd {
@@ -25,16 +31,6 @@ impl ForeignFd {
 			return Err(io::Error::last_os_error());
 		}
 		Ok(Self { local_fd })
-	}
-
-	pub(crate) fn from_proc_pid_fd(pid: libc::pid_t, fd: libc::c_int) -> Result<Self, io::Error> {
-		let path = format!("/proc/{pid}/fd/{fd}");
-		Self::from_path(&path)
-	}
-
-	pub(crate) fn from_proc_pid_cwd(pid: libc::pid_t) -> Result<Self, io::Error> {
-		let path = format!("/proc/{pid}/cwd");
-		Self::from_path(&path)
 	}
 }
 
@@ -79,10 +75,69 @@ pub struct FsTarget {
 	/// None if path is absolute.
 	pub(crate) dfd: Option<ForeignFd>,
 
-	pub(crate) path: String,
+	pub(crate) path: CString,
 }
 
 impl FsTarget {
+	pub(crate) fn from_path(
+		req: &mut RequestContext,
+		path_arg_index: u8,
+	) -> Result<Self, AccessRequestError> {
+		let path_ptr = req.arg(path_arg_index as usize) as *const libc::c_char;
+		let path = req.cstr_from_target_memory(path_ptr)?;
+		let pathb = path.as_bytes();
+		if pathb.len() > 0 && pathb[0] == b'/' {
+			Ok(Self { dfd: None, path })
+		} else {
+			let cwdstr = format!("/proc/{}/cwd", req.sreq.pid);
+			Ok(Self {
+				dfd: Some(
+					ForeignFd::from_path(&cwdstr)
+						.map_err(|e| AccessRequestError::OpenFd(cwdstr, e))?,
+				),
+				path,
+			})
+		}
+	}
+
+	pub(crate) fn from_at_path(
+		req: &mut RequestContext,
+		dfd_arg_index: u8,
+		path_arg_index: u8,
+	) -> Result<Self, AccessRequestError> {
+		let path_ptr = req.arg(path_arg_index as usize) as *const libc::c_char;
+		let path = req.cstr_from_target_memory(path_ptr)?;
+		let dfd = libc::c_int::try_from(req.arg(dfd_arg_index as usize) as i64)
+			.map_err(|_| AccessRequestError::InvalidSyscallData("dfd arg not a valid c_int"))?;
+		let pathb = path.as_bytes();
+		if pathb.len() > 0 && pathb[0] == b'/' {
+			return Ok(Self { dfd: None, path });
+		}
+		if dfd == libc::AT_FDCWD {
+			let cwdstr = format!("/proc/{}/cwd", req.sreq.pid);
+			Ok(Self {
+				dfd: Some(
+					ForeignFd::from_path(&cwdstr)
+						.map_err(|e| AccessRequestError::OpenFd(cwdstr, e))?,
+				),
+				path,
+			})
+		} else {
+			if dfd < 0 {
+				Err(AccessRequestError::InvalidSyscallData("dfd invalid"))
+			} else {
+				let proc_fd_path = format!("/proc/{}/fd/{}", req.sreq.pid, dfd);
+				Ok(Self {
+					dfd: Some(
+						ForeignFd::from_path(&proc_fd_path)
+							.map_err(|e| AccessRequestError::OpenFd(proc_fd_path, e))?,
+					),
+					path,
+				})
+			}
+		}
+	}
+
 	/// Opens the target with O_PATH.  This requires the path to actually
 	/// be pointing to an existing file or directory.
 	pub fn open_target(&self) -> Result<libc::c_int, io::Error> {
@@ -166,54 +221,165 @@ pub struct ExecOperation {
 }
 
 type SyscallHandler1 = fn(
-	sdata: &ScmpNotifData,
+	req: &mut RequestContext,
 	target: &FsTarget,
-) -> Result<(Operation, Option<Operation>), io::Error>;
+) -> Result<(Operation, Option<Operation>), AccessRequestError>;
 
 type SyscallHandler2 = fn(
-	sdata: &ScmpNotifData,
+	req: &mut RequestContext,
 	target1: &FsTarget,
 	target2: &FsTarget,
-) -> Result<(Operation, Option<Operation>), io::Error>;
+) -> Result<(Operation, Option<Operation>), AccessRequestError>;
 
 type SyscallHandlerCustom =
-	fn(sreq: &ScmpNotifReq, notify_fd: ScmpFd) -> Result<(Operation, Option<Operation>), io::Error>;
+	fn(req: &mut RequestContext) -> Result<(Operation, Option<Operation>), AccessRequestError>;
+
+// See https://syscalls.mebeim.net
+
+fn handle_open_like(
+	req: &mut RequestContext,
+	target: &FsTarget,
+	create_mode: Option<libc::mode_t>,
+	openat_flags: Option<u64>,
+	access_mode: Option<u64>,
+	openat2_resolve: Option<u64>,
+) -> Result<(Operation, Option<Operation>), AccessRequestError> {
+	todo!(
+		"Return the right Operation. For O_CREAT, return two operations - first an FsCreate, then FsOpen"
+	)
+}
+
+fn handle_openat2(
+	req: &mut RequestContext,
+	target: &FsTarget,
+) -> Result<(Operation, Option<Operation>), AccessRequestError> {
+	let open_how_ptr = req.arg(2) as *const libc::open_how;
+	let open_how = unsafe { req.value_from_target_memory(open_how_ptr) }?;
+	handle_open_like(
+		req,
+		target,
+		Some(open_how.mode as libc::mode_t),
+		Some(open_how.flags),
+		None,
+		Some(open_how.resolve),
+	)
+}
+
+fn handle_create_like(
+	req: &mut RequestContext,
+	target: &FsTarget,
+	mode: libc::mode_t,
+	kind: CreateKind,
+	symlink_from_arg_index: Option<u8>,
+	dev_t_arg_index: Option<u8>,
+) -> Result<(Operation, Option<Operation>), AccessRequestError> {
+	unimplemented!()
+}
 
 // (name, handler, arg index of the path)
 const FS_SYSCALLS_PATH: &'static [(&'static str, SyscallHandler1, u8)] = &[
-	("open", |sdata, target| unimplemented!(), 0),
-	("access", |sdata, target| unimplemented!(), 0),
-	("mkdir", |sdata, target| unimplemented!(), 0),
-	("rmdir", |sdata, target| unimplemented!(), 0),
-	("creat", |sdata, target| unimplemented!(), 0),
-	("mknod", |sdata, target| unimplemented!(), 0),
-	("unlink", |sdata, target| unimplemented!(), 0),
-	("execve", |sdata, target| unimplemented!(), 0),
-];
-// (name, handler, arg index of the dfd, arg index of the path)
-const FS_SYSCALLS_DFD_PATH: &'static [(&'static str, SyscallHandler1, u8, u8)] = &[
-	("openat", |sdata, target| unimplemented!(), 0, 1),
-	("openat2", |sdata, target| unimplemented!(), 0, 1),
-	("faccessat", |sdata, target| unimplemented!(), 0, 1),
-	("faccessat2", |sdata, target| unimplemented!(), 0, 1),
+	(
+		"open",
+		|req, target| {
+			handle_open_like(
+				req,
+				target,
+				Some(req.arg(2) as libc::mode_t),
+				Some(req.arg(1)),
+				Some(req.arg(2)),
+				None,
+			)
+		},
+		0,
+	),
+	(
+		"access",
+		|req, target| handle_open_like(req, target, None, None, Some(req.arg(1)), None),
+		0,
+	),
+	("mkdir", |req, target| unimplemented!(), 0),
+	("rmdir", |req, target| unimplemented!(), 0),
+	(
+		"creat",
+		|req, target| {
+			handle_open_like(
+				req,
+				target,
+				Some(req.arg(1) as libc::mode_t),
+				None,
+				None,
+				None,
+			)
+		},
+		0,
+	),
+	("mknod", |req, target| unimplemented!(), 0),
+	("unlink", |req, target| unimplemented!(), 0),
+	(
+		"execve",
+		|req, target| handle_open_like(req, target, None, None, Some(libc::X_OK as u64), None),
+		0,
+	),
 	// The "source" of a symlink is arbitrary data, so we don't treat it as a FsTarget.
-	("symlinkat", |sdata, target| unimplemented!(), 1, 2),
-	("unlinkat", |sdata, target| unimplemented!(), 0, 1),
-	("mkdirat", |sdata, target| unimplemented!(), 0, 1),
-	("mknodat", |sdata, target| unimplemented!(), 0, 1),
-	("execveat", |sdata, target| unimplemented!(), 0, 1),
+	("symlink", |req, target| unimplemented!(), 1),
+];
+
+// (name, handler, arg index of the dfd, arg index of the path)
+// todo: for this table and the other at table, we should have a few extra
+// fields to denote where to (if at all) find the AT_EMPTY_PATH and
+// AT_SYMLINK_NOFOLLOW flags - i.e. a non-negative arg index if we should
+// try to find the flag in the syscall arguments, or -1 if not.
+const FS_SYSCALLS_DFD_PATH: &'static [(&'static str, SyscallHandler1, u8, u8)] = &[
+	(
+		"openat",
+		|req, target| {
+			handle_open_like(
+				req,
+				target,
+				Some(req.arg(3) as libc::mode_t),
+				Some(req.arg(2)),
+				None,
+				None,
+			)
+		},
+		0,
+		1,
+	),
+	("openat2", handle_openat2, 0, 1),
+	(
+		"faccessat",
+		|req, target| handle_open_like(req, target, None, None, Some(req.arg(2)), None),
+		0,
+		1,
+	),
+	(
+		"faccessat2",
+		|req, target| handle_open_like(req, target, None, Some(req.arg(3)), Some(req.arg(2)), None),
+		0,
+		1,
+	),
+	// The "source" of a symlink is arbitrary data, so we don't treat it as a FsTarget.
+	("symlinkat", |req, target| unimplemented!(), 1, 2),
+	("unlinkat", |req, target| unimplemented!(), 0, 1),
+	("mkdirat", |req, target| unimplemented!(), 0, 1),
+	("mknodat", |req, target| unimplemented!(), 0, 1),
+	(
+		"execveat",
+		|req, target| handle_open_like(req, target, None, None, Some(libc::X_OK as u64), None),
+		0,
+		1,
+	),
 ];
 // (name, handler, arg index of the first path, arg index of the second path)
 const FS_SYSCALLS_PATH_PATH: &'static [(&'static str, SyscallHandler2, u8, u8)] = &[
-	("symlink", |sdata, target1, target2| unimplemented!(), 0, 1),
-	("rename", |sdata, target1, target2| unimplemented!(), 0, 1),
-	("link", |sdata, target1, target2| unimplemented!(), 0, 1),
+	("rename", |req, target1, target2| unimplemented!(), 0, 1),
+	("link", |req, target1, target2| unimplemented!(), 0, 1),
 ];
 // (name, handler, arg index of the first dfd, arg index of the first path, arg index of the second dfd, arg index of the second path)
 const FS_SYSCALLS_DFD_PATH_DFD_PATH: &'static [(&'static str, SyscallHandler2, u8, u8, u8, u8)] = &[
 	(
 		"renameat",
-		|sdata, target1, target2| unimplemented!(),
+		|req, target1, target2| unimplemented!(),
 		0,
 		1,
 		2,
@@ -221,7 +387,7 @@ const FS_SYSCALLS_DFD_PATH_DFD_PATH: &'static [(&'static str, SyscallHandler2, u
 	),
 	(
 		"renameat2",
-		|sdata, target1, target2| unimplemented!(),
+		|req, target1, target2| unimplemented!(),
 		0,
 		1,
 		2,
@@ -229,7 +395,7 @@ const FS_SYSCALLS_DFD_PATH_DFD_PATH: &'static [(&'static str, SyscallHandler2, u
 	),
 	(
 		"linkat",
-		|sdata, target1, target2| unimplemented!(),
+		|req, target1, target2| unimplemented!(),
 		0,
 		1,
 		2,
@@ -240,11 +406,98 @@ const FS_SYSCALLS_DFD_PATH_DFD_PATH: &'static [(&'static str, SyscallHandler2, u
 pub(crate) fn add_filter_rules(
 	filter_ctx: &mut ScmpFilterContext,
 ) -> Result<(), TurnstileTracerError> {
-	unimplemented!()
+	for list in &[
+		FS_SYSCALLS_PATH
+			.into_iter()
+			.map(|(name, _, _)| *name)
+			.collect::<Vec<_>>(),
+		FS_SYSCALLS_DFD_PATH
+			.into_iter()
+			.map(|(name, _, _, _)| *name)
+			.collect::<Vec<_>>(),
+		FS_SYSCALLS_PATH_PATH
+			.into_iter()
+			.map(|(name, _, _, _)| *name)
+			.collect::<Vec<_>>(),
+		FS_SYSCALLS_DFD_PATH_DFD_PATH
+			.into_iter()
+			.map(|(name, _, _, _, _, _)| *name)
+			.collect::<Vec<_>>(),
+	] {
+		for name in list {
+			let scmpc = ScmpSyscall::from_name(name)
+				.map_err(|e| TurnstileTracerError::ResolveSyscall(name, e))?;
+			filter_ctx
+				.add_rule(libseccomp::ScmpAction::Notify, scmpc)
+				.map_err(|e| TurnstileTracerError::AddRule(name, e))?;
+		}
+	}
+	Ok(())
+}
+
+pub(crate) fn handler_return_to_access_req(ret: (Operation, Option<Operation>)) -> AccessRequest {
+	let mut ar = AccessRequest {
+		operations: vec![ret.0],
+	};
+	if let Some(extra_op) = ret.1 {
+		ar.operations.push(extra_op);
+	}
+	ar
 }
 
 pub(crate) fn handle_notification<'a>(
-	request_ctx: &RequestContext<'a>,
+	request_ctx: &mut RequestContext<'a>,
 ) -> Result<Option<AccessRequest>, AccessRequestError> {
-	unimplemented!()
+	let sreq = request_ctx.sreq;
+
+	// todo: we really shouldn't be allocating and comparing strings on
+	// this path.  Optimize this later (which will likely require
+	// refactoring the above tables - maybe they need to be constructed at
+	// runtime with resolved syscall numbers).
+	let sysc = match sreq.data.syscall.get_name() {
+		Ok(name) => name,
+		Err(_) => {
+			// todo: warn
+			return Ok(None);
+		}
+	};
+
+	for &(name, handler, path_arg_index) in FS_SYSCALLS_PATH {
+		if sysc == name {
+			let target = FsTarget::from_path(request_ctx, path_arg_index)?;
+			let (op, extra_op) = handler(request_ctx, &target)?;
+			return Ok(Some(handler_return_to_access_req((op, extra_op))));
+		}
+	}
+
+	for &(name, handler, dfd_arg_index, path_arg_index) in FS_SYSCALLS_DFD_PATH {
+		if sysc == name {
+			let target = FsTarget::from_at_path(request_ctx, dfd_arg_index, path_arg_index)?;
+			let (op, extra_op) = handler(request_ctx, &target)?;
+			return Ok(Some(handler_return_to_access_req((op, extra_op))));
+		}
+	}
+
+	for &(name, handler, path1_arg_index, path2_arg_index) in FS_SYSCALLS_PATH_PATH {
+		if sysc == name {
+			let target1 = FsTarget::from_path(request_ctx, path1_arg_index)?;
+			let target2 = FsTarget::from_path(request_ctx, path2_arg_index)?;
+			let (op, extra_op) = handler(request_ctx, &target1, &target2)?;
+			return Ok(Some(handler_return_to_access_req((op, extra_op))));
+		}
+	}
+
+	for &(name, handler, dfd1_arg_index, path1_arg_index, dfd2_arg_index, path2_arg_index) in
+		FS_SYSCALLS_DFD_PATH_DFD_PATH
+	{
+		if sysc == name {
+			let target1 = FsTarget::from_at_path(request_ctx, dfd1_arg_index, path1_arg_index)?;
+			let target2 = FsTarget::from_at_path(request_ctx, dfd2_arg_index, path2_arg_index)?;
+			let (op, extra_op) = handler(request_ctx, &target1, &target2)?;
+			return Ok(Some(handler_return_to_access_req((op, extra_op))));
+		}
+	}
+
+	warn!("Unhandled syscall: {}", sysc);
+	Ok(None)
 }

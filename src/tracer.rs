@@ -65,10 +65,20 @@ impl TurnstileTracer {
 			sreq: req,
 			notify_fd,
 			valid: true,
+			mem_fd: fs::ForeignFd::from_path(&format!("/proc/{}/mem", req.pid))
+				.map_err(|e| AccessRequestError::ReadProcessMemory(req.pid, e))?,
 		};
 		let result = self.handle_notification(&mut ctx);
 		match result {
-			Ok(Some(access_req)) => Ok(Some((access_req, ctx))),
+			Ok(Some(access_req)) => {
+				if ctx.still_valid()? == false {
+					// If the notification is no longer valid, then we
+					// don't want to emit the access request (which might
+					// have been constructed out of invalid data)
+					return Ok(None);
+				}
+				Ok(Some((access_req, ctx)))
+			}
 			Ok(None) => {
 				ctx.send_continue()?;
 				Ok(None)
@@ -76,7 +86,7 @@ impl TurnstileTracer {
 			Err(e) => {
 				// If the notification is no longer valid, then we ignore
 				// any errors encountered while processing it.
-				if ctx.still_valid() == Ok(false) {
+				if ctx.still_valid().is_ok_and(|v| v == false) {
 					Ok(None)
 				} else {
 					_ = ctx.send_continue();
