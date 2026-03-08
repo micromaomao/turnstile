@@ -137,11 +137,11 @@ impl<'a> RequestContext<'a> {
 		&mut self,
 		src: *const libc::c_char,
 	) -> Result<std::ffi::CString, AccessRequestError> {
-		const PAGE_SIZE: usize = 4096;
+		let page_sz = page_size::get();
 		let addr = src as usize;
 
 		// First read: from addr to the end of the current page.
-		let first_end = (addr + PAGE_SIZE) & !(PAGE_SIZE - 1);
+		let first_end = (addr + page_sz) & !(page_sz - 1);
 		let first_len = first_end - addr;
 		let mut buf: Vec<u8> = Vec::with_capacity(first_len);
 
@@ -184,13 +184,13 @@ impl<'a> RequestContext<'a> {
 		// Second read: one more full page, appended directly to buf.
 		let second_addr = first_end;
 		let old_len = buf.len();
-		buf.reserve_exact(PAGE_SIZE);
+		buf.reserve_exact(page_sz);
 
 		let ret = unsafe {
 			libc::pread(
 				self.mem_fd.as_raw_fd(),
 				buf.as_mut_ptr().add(old_len) as *mut libc::c_void,
-				PAGE_SIZE,
+				page_sz,
 				second_addr as libc::off_t,
 			)
 		};
@@ -212,14 +212,14 @@ impl<'a> RequestContext<'a> {
 				.expect("buf should not have NUL bytes in the middle"));
 		}
 
-		if (ret as usize) < PAGE_SIZE {
+		if (ret as usize) < page_sz {
 			warn!(
 				"Short read from /proc/{}/mem: expected {} bytes, got {}",
-				self.sreq.pid, PAGE_SIZE, ret
+				self.sreq.pid, page_sz, ret
 			);
 			return Err(AccessRequestError::ShortReadProcessMemory(
 				self.sreq.pid,
-				PAGE_SIZE,
+				page_sz,
 				ret as usize,
 			));
 		}
