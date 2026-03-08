@@ -385,7 +385,9 @@ fn handle_open_like(
 			// X_OK alone => execution request.
 			if mode == libc::X_OK as u64 {
 				return Ok((
-					Operation::FsExec(ExecOperation { target: target.clone() }),
+					Operation::FsExec(ExecOperation {
+						target: target.clone(),
+					}),
 					None,
 				));
 			}
@@ -415,10 +417,10 @@ fn handle_open_like(
 	let flags = openat_flags.unwrap_or((libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC) as u64)
 		as libc::c_int;
 
-	let need_read = flags & libc::O_PATH == 0
-		&& (flags & libc::O_RDWR != 0 || flags & libc::O_WRONLY == 0);
-	let need_write = flags & libc::O_PATH == 0
-		&& (flags & libc::O_RDWR != 0 || flags & libc::O_WRONLY != 0);
+	let need_read =
+		flags & libc::O_PATH == 0 && (flags & libc::O_RDWR != 0 || flags & libc::O_WRONLY == 0);
+	let need_write =
+		flags & libc::O_PATH == 0 && (flags & libc::O_RDWR != 0 || flags & libc::O_WRONLY != 0);
 
 	// Create if O_CREAT is set, or if there are no openat_flags (creat syscall).
 	let creates = create_mode.is_some() && (flags & libc::O_CREAT != 0 || openat_flags.is_none());
@@ -429,10 +431,21 @@ fn handle_open_like(
 			mode: create_mode.unwrap(),
 			kind: CreateKind::File,
 		});
-		let open_op = Operation::FsOpen(OpenOperation { target: target.clone(), need_read, need_write });
+		let open_op = Operation::FsOpen(OpenOperation {
+			target: target.clone(),
+			need_read,
+			need_write,
+		});
 		Ok((create_op, Some(open_op)))
 	} else {
-		Ok((Operation::FsOpen(OpenOperation { target: target.clone(), need_read, need_write }), None))
+		Ok((
+			Operation::FsOpen(OpenOperation {
+				target: target.clone(),
+				need_read,
+				need_write,
+			}),
+			None,
+		))
 	}
 }
 
