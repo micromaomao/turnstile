@@ -135,18 +135,11 @@ impl<'a> RequestContext<'a> {
 		let first_end = (addr + page_sz) & !(page_sz - 1);
 		let first_len = first_end - addr;
 		let mut buf: Vec<u8> = Vec::with_capacity(first_len);
-
-		// Safety: we pass spare capacity to read_target_memory_partial,
-		// which writes at most first_len bytes, then we set_len to the
-		// actual number of bytes written.
 		let uninit_buf = unsafe {
-			slice::from_raw_parts_mut(
-				buf.as_mut_ptr() as *mut MaybeUninit<u8>,
-				first_len,
-			)
+			slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut MaybeUninit<u8>, first_len)
 		};
-		let ret = self.read_target_memory_partial(addr as *const u8, uninit_buf)?;
-		unsafe { buf.set_len(ret) };
+		self.read_target_memory(addr as *const u8, uninit_buf)?;
+		unsafe { buf.set_len(first_len) };
 
 		if let Some(nul) = buf.iter().position(|&b| b == 0) {
 			buf.truncate(nul + 1);
@@ -155,52 +148,23 @@ impl<'a> RequestContext<'a> {
 				.expect("buf should not have NUL bytes in the middle"));
 		}
 
-		if ret < first_len {
-			warn!(
-				"Short read from /proc/{}/mem: expected {} bytes, got {}",
-				self.sreq.pid, first_len, ret
-			);
-			return Err(AccessRequestError::ShortReadProcessMemory(
-				self.sreq.pid,
-				first_len,
-				ret,
-			));
-		}
-
 		// Second read: one more full page appended to buf
 		let old_len = buf.len();
 		buf.reserve_exact(page_sz);
 
-		let uninit_buf = unsafe {
+		let uninit_buf_2 = unsafe {
 			slice::from_raw_parts_mut(
 				buf.as_mut_ptr().add(old_len) as *mut MaybeUninit<u8>,
 				page_sz,
 			)
 		};
-		let ret = self.read_target_memory_partial(first_end as *const u8, uninit_buf)?;
-		// Safety: read_target_memory_partial wrote ret bytes into buf's
-		// spare capacity starting at old_len.
-		unsafe { buf.set_len(old_len + ret) };
+		self.read_target_memory(first_end as *const u8, uninit_buf_2)?;
+		unsafe { buf.set_len(old_len + page_sz) };
 
 		if let Some(nul) = buf[old_len..].iter().position(|&b| b == 0) {
 			buf.truncate(old_len + nul + 1);
-			// buf was NUL-free up to old_len (first page had none) and we
-			// truncated so that the first NUL in the second page is the single
-			// trailing NUL byte, with no interior NUL bytes before it.
 			return Ok(std::ffi::CString::from_vec_with_nul(buf)
 				.expect("buf should not have NUL bytes in the middle"));
-		}
-
-		if ret < page_sz {
-			warn!(
-				"Short read from /proc/{}/mem: expected {} bytes, got {}",
-				self.sreq.pid, page_sz, ret
-			);
-			return Err(AccessRequestError::ShortReadProcessMemory(
-				self.sreq.pid,
-				page_sz,
-				ret,
-			));
 		}
 
 		Err(AccessRequestError::InvalidSyscallData(
@@ -231,10 +195,6 @@ impl<'a> RequestContext<'a> {
 		}
 	}
 
-	/// Low-level helper: reads up to `buf.len()` bytes from the target
-	/// process's memory at `src`.  Returns the number of bytes actually
-	/// read.  A negative `pread` return is mapped to
-	/// `ReadProcessMemory`.
 	fn read_target_memory_partial(
 		&mut self,
 		src: *const u8,
