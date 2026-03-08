@@ -4,7 +4,7 @@ use libseccomp::ScmpFilterContext;
 
 use crate::{
 	AccessRequest, AccessRequestError, Operation, TurnstileTracerError,
-	syscalls::{RequestContext, fs::ForeignFd, fs::FsTarget, lazy_syscall_table_name_to_number, syscall_name_for_error},
+	syscalls::{RequestContext, fs::ForeignFd, fs::FsTarget, lazy_syscall_table_name_to_number},
 };
 
 /// (name, handler, addr arg index, addrlen arg index).
@@ -29,7 +29,7 @@ pub(crate) fn add_filter_rules(
 	for &(sys, ..) in unix_sock_syscalls_table() {
 		filter_ctx
 			.add_rule(libseccomp::ScmpAction::Notify, sys)
-			.map_err(|e| TurnstileTracerError::AddRule(syscall_name_for_error(sys), e))?;
+			.map_err(|e| TurnstileTracerError::AddRule(sys, e))?;
 	}
 	Ok(())
 }

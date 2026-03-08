@@ -18,8 +18,8 @@ pub enum TurnstileTracerError {
 	TransferNotifyFd(std::io::Error),
 	#[error("failed to resolve syscall {0}: {1}")]
 	ResolveSyscall(&'static str, libseccomp::error::SeccompError),
-	#[error("failed to add filter rule for {0}: {1}")]
-	AddRule(String, libseccomp::error::SeccompError),
+	#[error("failed to add filter rule for syscall {0}: {1}")]
+	AddRule(libseccomp::ScmpSyscall, libseccomp::error::SeccompError),
 }
 
 #[derive(Error, Debug)]

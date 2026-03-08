@@ -10,7 +10,7 @@ use crate::{
 	AccessRequest, AccessRequestError, Operation, TurnstileTracerError, syscalls::RequestContext,
 };
 
-use super::{lazy_syscall_table_name_to_number, syscall_name_for_error};
+use super::lazy_syscall_table_name_to_number;
 
 use log::warn;
 
@@ -715,22 +715,22 @@ pub(crate) fn add_filter_rules(
 	for &(sys, ..) in fs_syscalls_path_table() {
 		filter_ctx
 			.add_rule(libseccomp::ScmpAction::Notify, sys)
-			.map_err(|e| TurnstileTracerError::AddRule(syscall_name_for_error(sys), e))?;
+			.map_err(|e| TurnstileTracerError::AddRule(sys, e))?;
 	}
 	for &(sys, ..) in fs_syscalls_dfd_path_table() {
 		filter_ctx
 			.add_rule(libseccomp::ScmpAction::Notify, sys)
-			.map_err(|e| TurnstileTracerError::AddRule(syscall_name_for_error(sys), e))?;
+			.map_err(|e| TurnstileTracerError::AddRule(sys, e))?;
 	}
 	for &(sys, ..) in fs_syscalls_path_path_table() {
 		filter_ctx
 			.add_rule(libseccomp::ScmpAction::Notify, sys)
-			.map_err(|e| TurnstileTracerError::AddRule(syscall_name_for_error(sys), e))?;
+			.map_err(|e| TurnstileTracerError::AddRule(sys, e))?;
 	}
 	for &(sys, ..) in fs_syscall_dfd_path_dfd_path_table() {
 		filter_ctx
 			.add_rule(libseccomp::ScmpAction::Notify, sys)
-			.map_err(|e| TurnstileTracerError::AddRule(syscall_name_for_error(sys), e))?;
+			.map_err(|e| TurnstileTracerError::AddRule(sys, e))?;
 	}
 	Ok(())
 }
