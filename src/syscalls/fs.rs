@@ -28,15 +28,8 @@ impl ForeignFd {
 	pub(crate) fn from_path(path: &str) -> Result<Self, io::Error> {
 		// path is always an ASCII /proc/... string that we construct ourselves,
 		// so it will never contain interior NUL bytes.
-		let c_path =
-			CString::new(path).expect("ForeignFd::from_path: path should not contain NUL bytes");
-		let local_fd = unsafe {
-			libc::open(
-				c_path.as_ptr(),
-				libc::O_PATH | libc::O_CLOEXEC,
-				0,
-			)
-		};
+		let c_path = CString::new(path).expect("path should not contain NUL bytes");
+		let local_fd = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC, 0) };
 		if local_fd < 0 {
 			return Err(io::Error::last_os_error());
 		}
