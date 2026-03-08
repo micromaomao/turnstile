@@ -46,22 +46,19 @@ fn read_sockaddr_un(
 		return Ok(None);
 	}
 	let addrlen = req.arg(addrlen_arg) as usize;
-	let path_offset = offset_of!(libc::sockaddr_un, sun_path);
+	const OFFSET_FAMILY: usize = offset_of!(libc::sockaddr_un, sun_family);
+	const OFFSET_PATH: usize = offset_of!(libc::sockaddr_un, sun_path);
 	// We need at least sa_family (2 bytes) + 1 path byte.
-	if addrlen < path_offset + 1 {
+	if addrlen < OFFSET_PATH + 1 {
 		return Ok(None);
 	}
 
-	// Read the entire sockaddr in one pread call.
 	let mut buf: Vec<u8> = Vec::with_capacity(addrlen);
 	req.read_target_memory(addr_ptr as *const u8, buf.spare_capacity_mut())?;
-	// Safety: read_target_memory initialized all addrlen bytes.
 	unsafe { buf.set_len(addrlen) };
 
-	// Check the address family.
-	let family_offset = offset_of!(libc::sockaddr_un, sun_family);
 	let family = libc::sa_family_t::from_ne_bytes(
-		buf[family_offset..family_offset + std::mem::size_of::<libc::sa_family_t>()]
+		buf[OFFSET_FAMILY..OFFSET_FAMILY + std::mem::size_of::<libc::sa_family_t>()]
 			.try_into()
 			.unwrap(),
 	);
@@ -69,24 +66,27 @@ fn read_sockaddr_un(
 		return Ok(None);
 	}
 
-	// Extract the Unix path.  Abstract-namespace sockets have sun_path[0] == 0;
-	// those have no filesystem path, so skip them.
-	let path_bytes = &buf[path_offset..];
+	// Abstract-namespace sockets have sun_path[0] == 0 and do not
+	// represent filesystem paths, so skip them.
+	let path_bytes = &buf[OFFSET_PATH..];
 	if path_bytes.first() == Some(&0) {
 		return Ok(None);
 	}
 
 	let path = match path_bytes.iter().position(|&b| b == 0) {
-		Some(nul_pos) => std::ffi::CString::from_vec_with_nul(path_bytes[..nul_pos + 1].to_vec())
-			.expect("sun_path should not contain interior NUL bytes"),
-		None => std::ffi::CString::new(path_bytes)
-			.expect("path_bytes should not contain interior NUL bytes"),
+		Some(nul_pos) => std::ffi::CStr::from_bytes_with_nul(&path_bytes[..nul_pos + 1])
+			.expect(".position should have ensured no NUL bytes in the middle"),
+		None => {
+			return Err(AccessRequestError::InvalidSyscallData(
+				"sun_path in sockaddr_un not NUL-terminated",
+			));
+		}
 	};
 
-	let target = if path.as_bytes().first() == Some(&b'/') {
+	let target = if path.to_bytes().first() == Some(&b'/') {
 		FsTarget {
 			dfd: None,
-			path,
+			path: path.to_owned(),
 			no_follow: false,
 		}
 	} else {
@@ -96,7 +96,7 @@ fn read_sockaddr_un(
 				ForeignFd::from_path(CStr::from_bytes_with_nul(cwdstr.as_bytes()).unwrap())
 					.map_err(|e| AccessRequestError::OpenFd(cwdstr, e))?,
 			),
-			path,
+			path: path.to_owned(),
 			no_follow: false,
 		}
 	};
