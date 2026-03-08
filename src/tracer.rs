@@ -8,7 +8,7 @@ use libseccomp_sys::scmp_filter_ctx;
 
 use crate::{
 	AccessRequest, AccessRequestError, TurnstileTracerError,
-	syscalls::{RequestContext, fs},
+	syscalls::{RequestContext, fs, net},
 };
 
 #[derive(Debug)]
@@ -34,7 +34,7 @@ impl TurnstileTracer {
 			.map_err(TurnstileTracerError::AddArch)?;
 
 		fs::add_filter_rules(&mut filter_ctx)?;
-		crate::syscalls::net::add_filter_rules(&mut filter_ctx)?;
+		net::add_filter_rules(&mut filter_ctx)?;
 
 		Ok(Self {
 			filter_ctx,
