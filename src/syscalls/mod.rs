@@ -163,11 +163,10 @@ impl<'a> RequestContext<'a> {
 		unsafe { buf.set_len(ret as usize) };
 
 		if let Some(nul) = buf.iter().position(|&b| b == 0) {
-			buf.truncate(nul);
-			// buf has been truncated at the NUL position; no interior NUL is possible.
-			return Ok(
-				std::ffi::CString::new(buf).expect("buf should not have NUL bytes in the middle")
-			);
+			buf.truncate(nul + 1);
+			// buf has been truncated to include the first NUL byte; no interior NUL is possible.
+			return Ok(std::ffi::CString::from_vec_with_nul(buf)
+				.expect("buf should not have NUL bytes in the middle"));
 		}
 
 		if (ret as usize) < first_len {
@@ -205,12 +204,12 @@ impl<'a> RequestContext<'a> {
 		unsafe { buf.set_len(old_len + ret as usize) };
 
 		if let Some(nul) = buf[old_len..].iter().position(|&b| b == 0) {
-			buf.truncate(old_len + nul);
+			buf.truncate(old_len + nul + 1);
 			// buf was NUL-free up to old_len (first page had none) and we
-			// truncated at the first NUL in the second page, so no interior NUL.
-			return Ok(
-				std::ffi::CString::new(buf).expect("buf should not have NUL bytes in the middle")
-			);
+			// truncated so that the first NUL in the second page is the single
+			// trailing NUL byte, with no interior NUL bytes before it.
+			return Ok(std::ffi::CString::from_vec_with_nul(buf)
+				.expect("buf should not have NUL bytes in the middle"));
 		}
 
 		if (ret as usize) < PAGE_SIZE {
