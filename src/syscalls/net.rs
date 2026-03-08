@@ -9,17 +9,17 @@ use crate::{
 
 /// Unix socket syscalls to intercept:
 /// (name, operation builder, addr arg index, addrlen arg index).
-const UNIX_SOCK_SYSCALLS: &[(&str, fn(&FsTarget) -> Operation, u8, u8)] = &[
-	("connect", |t| Operation::UnixConnect(t.clone()), 1, 2),
-	("bind", |t| Operation::UnixListen(t.clone()), 1, 2),
-	("sendto", |t| Operation::UnixSendto(t.clone()), 4, 5),
-	("recvfrom", |t| Operation::UnixRecvfrom(t.clone()), 4, 5),
+const UNIX_SOCK_SYSCALLS: &[(&str, fn(FsTarget) -> Operation, u8, u8)] = &[
+	("connect", |t| Operation::UnixConnect(t), 1, 2),
+	("bind", |t| Operation::UnixListen(t), 1, 2),
+	("sendto", |t| Operation::UnixSendto(t), 4, 5),
+	("recvfrom", |t| Operation::UnixRecvfrom(t), 4, 5),
 ];
 
 lazy_syscall_table_name_to_number!(
 	UNIX_SOCK_SYSCALLS,
 	resolved_unix_sock_syscalls,
-	fn(&FsTarget) -> Operation,
+	fn(FsTarget) -> Operation,
 	u8,
 	u8
 );
@@ -108,7 +108,7 @@ pub(crate) fn handle_notification<'a>(
 		if let Some(target) =
 			read_unix_target(request_ctx, addr_arg as usize, addrlen_arg as usize)?
 		{
-			let op = builder(&target);
+			let op = builder(target);
 			return Ok(Some(AccessRequest {
 				operations: vec![op],
 			}));

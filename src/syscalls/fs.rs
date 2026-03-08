@@ -342,33 +342,33 @@ pub struct ExecOperation {
 
 type SyscallHandler1 = fn(
 	req: &mut RequestContext,
-	target: &FsTarget,
+	target: FsTarget,
 ) -> Result<(Operation, Option<Operation>), AccessRequestError>;
 
 type SyscallHandler2 = fn(
 	req: &mut RequestContext,
-	target1: &FsTarget,
-	target2: &FsTarget,
+	target1: FsTarget,
+	target2: FsTarget,
 ) -> Result<(Operation, Option<Operation>), AccessRequestError>;
 
 // See https://syscalls.mebeim.net
 
 fn handle_access_like(
 	_req: &mut RequestContext,
-	target: &FsTarget,
+	target: FsTarget,
 	access_mode: u64,
 ) -> Result<(Operation, Option<Operation>), AccessRequestError> {
 	if access_mode == libc::X_OK as u64 {
 		return Ok((
 			Operation::FsExec(ExecOperation {
-				target: target.clone(),
+				target,
 			}),
 			None,
 		));
 	}
 	Ok((
 		Operation::FsOpen(OpenOperation {
-			target: target.clone(),
+			target,
 			need_read: access_mode & libc::R_OK as u64 != 0,
 			need_write: access_mode & libc::W_OK as u64 != 0,
 		}),
@@ -378,7 +378,7 @@ fn handle_access_like(
 
 fn handle_open_like(
 	_req: &mut RequestContext,
-	target: &FsTarget,
+	target: FsTarget,
 	create_mode: Option<libc::mode_t>,
 	openat_flags: Option<u64>,
 	_openat2_resolve: Option<u64>,
@@ -404,7 +404,7 @@ fn handle_open_like(
 			kind: CreateKind::File,
 		});
 		let open_op = Operation::FsOpen(OpenOperation {
-			target: target.clone(),
+			target,
 			need_read,
 			need_write,
 		});
@@ -412,7 +412,7 @@ fn handle_open_like(
 	} else {
 		Ok((
 			Operation::FsOpen(OpenOperation {
-				target: target.clone(),
+				target,
 				need_read,
 				need_write,
 			}),
@@ -423,7 +423,7 @@ fn handle_open_like(
 
 fn handle_openat2(
 	req: &mut RequestContext,
-	target: &FsTarget,
+	target: FsTarget,
 ) -> Result<(Operation, Option<Operation>), AccessRequestError> {
 	let open_how_ptr = req.arg(2) as *const libc::open_how;
 	let open_how = req.value_from_target_memory(open_how_ptr)?;
@@ -437,13 +437,13 @@ fn handle_openat2(
 }
 
 fn handle_mknod_like(
-	target: &FsTarget,
+	target: FsTarget,
 	mode: libc::mode_t,
 	kind: CreateKind,
 ) -> Result<(Operation, Option<Operation>), AccessRequestError> {
 	Ok((
 		Operation::FsCreate(crate::syscalls::fs::CreateOperation {
-			target: target.clone(),
+			target,
 			mode,
 			kind,
 		}),
@@ -453,14 +453,14 @@ fn handle_mknod_like(
 
 fn handle_symlink_like(
 	req: &mut RequestContext,
-	target: &FsTarget,
+	target: FsTarget,
 	src_arg_index: u8,
 ) -> Result<(Operation, Option<Operation>), AccessRequestError> {
 	let src_ptr = req.arg(src_arg_index as usize) as *const libc::c_char;
 	let src = req.cstr_from_target_memory(src_ptr)?;
 	Ok((
 		Operation::FsCreate(crate::syscalls::fs::CreateOperation {
-			target: target.clone(),
+			target,
 			mode: 0o777,
 			kind: CreateKind::Symlink { target: src },
 		}),
@@ -498,7 +498,7 @@ const FS_SYSCALLS_PATH: &'static [(&'static str, SyscallHandler1, u8)] = &[
 		|_req, target| {
 			Ok((
 				Operation::FsUnlink(crate::syscalls::fs::UnlinkOperation {
-					target: target.clone(),
+					target,
 					dir: true,
 				}),
 				None,
@@ -531,7 +531,7 @@ const FS_SYSCALLS_PATH: &'static [(&'static str, SyscallHandler1, u8)] = &[
 		|_req, target| {
 			Ok((
 				Operation::FsUnlink(crate::syscalls::fs::UnlinkOperation {
-					target: target.clone(),
+					target,
 					dir: false,
 				}),
 				None,
@@ -603,7 +603,7 @@ const FS_SYSCALLS_DFD_PATH: &'static [(&'static str, SyscallHandler1, u8, u8, Op
 			let dir = flags & libc::AT_REMOVEDIR as u64 != 0;
 			Ok((
 				Operation::FsUnlink(crate::syscalls::fs::UnlinkOperation {
-					target: target.clone(),
+					target,
 					dir,
 				}),
 				None,
@@ -652,8 +652,8 @@ const FS_SYSCALLS_PATH_PATH: &'static [(&'static str, SyscallHandler2, u8, u8)] 
 		|_req, target1, target2| {
 			Ok((
 				Operation::FsRename(crate::syscalls::fs::RenameOperation {
-					from: target1.clone(),
-					to: target2.clone(),
+					from: target1,
+					to: target2,
 					exchange: false,
 				}),
 				None,
@@ -667,8 +667,8 @@ const FS_SYSCALLS_PATH_PATH: &'static [(&'static str, SyscallHandler2, u8, u8)] 
 		|_req, target1, target2| {
 			Ok((
 				Operation::FsLink(crate::syscalls::fs::LinkOperation {
-					from: target1.clone(),
-					to: target2.clone(),
+					from: target1,
+					to: target2,
 					follow_src_symlink: false,
 				}),
 				None,
@@ -696,8 +696,8 @@ const FS_SYSCALLS_DFD_PATH_DFD_PATH: &'static [(
 		|_req, target1, target2| {
 			Ok((
 				Operation::FsRename(crate::syscalls::fs::RenameOperation {
-					from: target1.clone(),
-					to: target2.clone(),
+					from: target1,
+					to: target2,
 					exchange: false,
 				}),
 				None,
@@ -716,8 +716,8 @@ const FS_SYSCALLS_DFD_PATH_DFD_PATH: &'static [(
 			let exchange = req.arg(4) & (1u64 << 1) != 0;
 			Ok((
 				Operation::FsRename(crate::syscalls::fs::RenameOperation {
-					from: target1.clone(),
-					to: target2.clone(),
+					from: target1,
+					to: target2,
 					exchange,
 				}),
 				None,
@@ -736,8 +736,8 @@ const FS_SYSCALLS_DFD_PATH_DFD_PATH: &'static [(
 			let follow_src_symlink = flags & libc::AT_SYMLINK_FOLLOW as u64 != 0;
 			Ok((
 				Operation::FsLink(crate::syscalls::fs::LinkOperation {
-					from: target1.clone(),
-					to: target2.clone(),
+					from: target1,
+					to: target2,
 					follow_src_symlink,
 				}),
 				None,
@@ -832,7 +832,7 @@ pub(crate) fn handle_notification<'a>(
 	for &(scmp, handler, path_arg_index) in resolved_path() {
 		if syscall == scmp {
 			let target = FsTarget::from_path(request_ctx, path_arg_index)?;
-			let (op, extra_op) = handler(request_ctx, &target)?;
+			let (op, extra_op) = handler(request_ctx, target)?;
 			return Ok(Some(handler_return_to_access_req((op, extra_op))));
 		}
 	}
@@ -842,7 +842,7 @@ pub(crate) fn handle_notification<'a>(
 			let at_flags = flags_arg_index.map(|i| request_ctx.arg(i as usize));
 			let target =
 				FsTarget::from_at_path(request_ctx, dfd_arg_index, path_arg_index, at_flags)?;
-			let (op, extra_op) = handler(request_ctx, &target)?;
+			let (op, extra_op) = handler(request_ctx, target)?;
 			return Ok(Some(handler_return_to_access_req((op, extra_op))));
 		}
 	}
@@ -851,7 +851,7 @@ pub(crate) fn handle_notification<'a>(
 		if syscall == scmp {
 			let target1 = FsTarget::from_path(request_ctx, path1_arg_index)?;
 			let target2 = FsTarget::from_path(request_ctx, path2_arg_index)?;
-			let (op, extra_op) = handler(request_ctx, &target1, &target2)?;
+			let (op, extra_op) = handler(request_ctx, target1, target2)?;
 			return Ok(Some(handler_return_to_access_req((op, extra_op))));
 		}
 	}
@@ -872,7 +872,7 @@ pub(crate) fn handle_notification<'a>(
 				FsTarget::from_at_path(request_ctx, dfd1_arg_index, path1_arg_index, at_flags)?;
 			let target2 =
 				FsTarget::from_at_path(request_ctx, dfd2_arg_index, path2_arg_index, None)?;
-			let (op, extra_op) = handler(request_ctx, &target1, &target2)?;
+			let (op, extra_op) = handler(request_ctx, target1, target2)?;
 			return Ok(Some(handler_return_to_access_req((op, extra_op))));
 		}
 	}
