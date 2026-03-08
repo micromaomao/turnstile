@@ -143,13 +143,7 @@ impl<'a> RequestContext<'a> {
 		// First read: from addr to the end of the current page.
 		let first_end = (addr + PAGE_SIZE) & !(PAGE_SIZE - 1);
 		let first_len = first_end - addr;
-		// Avoid zero-initializing: pread will fill the bytes and we'll truncate
-		// to the actual number read before inspecting the buffer.
-		let mut buf: Vec<u8> = Vec::new();
-		buf.reserve_exact(first_len);
-		// Safety: the bytes are written by pread before we inspect them, and we
-		// truncate to the number of bytes actually written immediately after.
-		unsafe { buf.set_len(first_len) };
+		let mut buf: Vec<u8> = Vec::with_capacity(first_len);
 
 		let ret = unsafe {
 			libc::pread(
@@ -165,7 +159,8 @@ impl<'a> RequestContext<'a> {
 				io::Error::last_os_error(),
 			));
 		}
-		buf.truncate(ret as usize);
+		// Safety: pread wrote ret bytes into the buffer's spare capacity.
+		unsafe { buf.set_len(ret as usize) };
 
 		if let Some(nul) = buf.iter().position(|&b| b == 0) {
 			buf.truncate(nul);
@@ -189,10 +184,7 @@ impl<'a> RequestContext<'a> {
 
 		// Second read: one more full page.
 		let second_addr = first_end;
-		let mut buf2: Vec<u8> = Vec::new();
-		buf2.reserve_exact(PAGE_SIZE);
-		// Safety: same as above — pread fills these bytes before we read them.
-		unsafe { buf2.set_len(PAGE_SIZE) };
+		let mut buf2: Vec<u8> = Vec::with_capacity(PAGE_SIZE);
 
 		let ret = unsafe {
 			libc::pread(
@@ -208,7 +200,8 @@ impl<'a> RequestContext<'a> {
 				io::Error::last_os_error(),
 			));
 		}
-		buf2.truncate(ret as usize);
+		// Safety: pread wrote ret bytes into the buffer's spare capacity.
+		unsafe { buf2.set_len(ret as usize) };
 
 		if let Some(nul) = buf2.iter().position(|&b| b == 0) {
 			buf.extend_from_slice(&buf2[..nul]);

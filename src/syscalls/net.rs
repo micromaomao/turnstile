@@ -13,6 +13,7 @@ const UNIX_SOCK_SYSCALLS: &[(&str, fn(&FsTarget) -> Operation, u8, u8)] = &[
 	("connect", |t| Operation::UnixConnect(t.clone()), 1, 2),
 	("bind", |t| Operation::UnixListen(t.clone()), 1, 2),
 	("sendto", |t| Operation::UnixSendto(t.clone()), 4, 5),
+	("recvfrom", |t| Operation::UnixRecvfrom(t.clone()), 4, 5),
 ];
 
 lazy_syscall_table_name_to_number!(
@@ -63,16 +64,14 @@ fn read_unix_target(
 	// sun_path starts at offset 2 (right after sa_family_t).
 	let sun_path_ptr = (addr_ptr + 2) as *const libc::c_char;
 
-	// Abstract-namespace sockets have sun_path[0] == '\0'.
-	let first_byte = req.value_from_target_memory(sun_path_ptr as *const u8)?;
-	if first_byte == 0 {
+	let path = req.cstr_from_target_memory(sun_path_ptr)?;
+
+	// Abstract-namespace sockets have an empty sun_path (the first byte is '\0').
+	if path.as_bytes().is_empty() {
 		return Ok(None);
 	}
 
-	let path = req.cstr_from_target_memory(sun_path_ptr)?;
-	let path_bytes = path.as_bytes();
-
-	let target = if path_bytes.first() == Some(&b'/') {
+	let target = if path.as_bytes().first() == Some(&b'/') {
 		FsTarget {
 			dfd: None,
 			path,

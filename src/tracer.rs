@@ -188,9 +188,11 @@ impl TurnstileTracer {
 				let scmpctx_ptr = scmpctx_ptr.into_ptr();
 				let rc = libseccomp_sys::seccomp_load(scmpctx_ptr);
 				if rc != 0 {
-					// from_raw_os_error stores a plain i32 (Repr::Os) and does
-					// not allocate, so it is safe to call in this pre_exec context.
-					return Err(std::io::Error::from_raw_os_error(-rc));
+					// rc is a libseccomp-specific error code (not an OS errno),
+					// so we cannot meaningfully wrap it in io::Error.  A panic
+					// is appropriate: seccomp_load failing means the filter is
+					// fundamentally broken.
+					panic!("seccomp_load failed with error code {}", rc);
 				}
 				let notify_fd = libseccomp_sys::seccomp_notify_fd(scmpctx_ptr);
 				if notify_fd < 0 {
