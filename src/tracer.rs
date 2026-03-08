@@ -264,7 +264,7 @@ unsafe fn send_fd_via_scm_rights(sock: libc::c_int, fd: libc::c_int) -> std::io:
 		(*cmsg).cmsg_len =
 			libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as libc::c_uint) as libc::size_t;
 		let fd_data = libc::CMSG_DATA(cmsg) as *mut libc::c_int;
-		*fd_data = fd;
+		std::ptr::write_unaligned(fd_data, fd);
 	}
 
 	let ret = unsafe { libc::sendmsg(sock, &msg, libc::MSG_NOSIGNAL) };
@@ -311,6 +311,6 @@ fn recv_fd_via_scm_rights(sock: libc::c_int) -> std::io::Result<libc::c_int> {
 			"no control message received",
 		));
 	}
-	let received_fd = unsafe { *(libc::CMSG_DATA(cmsg) as *const libc::c_int) };
+	let received_fd = unsafe { std::ptr::read_unaligned(libc::CMSG_DATA(cmsg) as *const libc::c_int) };
 	Ok(received_fd)
 }

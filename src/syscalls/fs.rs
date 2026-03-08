@@ -26,9 +26,13 @@ pub struct ForeignFd {
 
 impl ForeignFd {
 	pub(crate) fn from_path(path: &str) -> Result<Self, io::Error> {
+		// path is always an ASCII /proc/... string that we construct ourselves,
+		// so it will never contain interior NUL bytes.
+		let c_path =
+			CString::new(path).expect("ForeignFd::from_path: path should not contain NUL bytes");
 		let local_fd = unsafe {
 			libc::open(
-				path.as_ptr() as *const libc::c_char,
+				c_path.as_ptr(),
 				libc::O_PATH | libc::O_CLOEXEC,
 				0,
 			)
@@ -248,7 +252,7 @@ impl FsTarget {
 	/// Return the absolute path of the target.  This requires everything
 	/// except the final component of the path to exist (which is a normal
 	/// requirement of most fs syscalls anyway).
-	pub fn realpath(&self) -> Result<String, io::Error> {
+	pub fn realpath(&self) -> Result<CString, io::Error> {
 		let path_bytes = self.path.to_bytes();
 
 		// AT_EMPTY_PATH: the target is the dfd itself — read its proc symlink.
@@ -257,24 +261,21 @@ impl FsTarget {
 				.dfd
 				.as_ref()
 				.expect("Expected dfd to exist for non-absolute path");
-			return readlink_fd(dfd.as_raw_fd())?
-				.into_string()
-				.map_err(|_| io::Error::from_raw_os_error(libc::EILSEQ));
+			return readlink_fd(dfd.as_raw_fd());
 		}
 
 		let (dir_fd, file_name) = self.open_target_dir()?;
-		let mut result = readlink_fd(dir_fd.as_raw_fd())?
-			.into_string()
-			.map_err(|_| io::Error::from_raw_os_error(libc::EILSEQ))?;
+		let dir_path = readlink_fd(dir_fd.as_raw_fd())?;
 		let file_name_bytes = file_name.to_bytes();
-		if !file_name_bytes.is_empty() {
-			result.push('/');
-			result.push_str(
-				std::str::from_utf8(file_name_bytes)
-					.map_err(|_| io::Error::from_raw_os_error(libc::EILSEQ))?,
-			);
+		if file_name_bytes.is_empty() {
+			return Ok(dir_path);
 		}
-		Ok(result)
+		let mut result = dir_path.into_bytes();
+		result.push(b'/');
+		result.extend_from_slice(file_name_bytes);
+		// Neither readlink results nor CStr file-name bytes can contain NUL,
+		// so CString::new cannot fail here.
+		Ok(CString::new(result).expect("path components should not contain NUL bytes"))
 	}
 }
 
@@ -318,7 +319,7 @@ pub struct CreateOperation {
 pub enum CreateKind {
 	File,
 	Directory,
-	Symlink { target: String },
+	Symlink { target: CString },
 	Device { dev: libc::dev_t },
 }
 
@@ -465,14 +466,11 @@ fn handle_symlink_like(
 ) -> Result<(Operation, Option<Operation>), AccessRequestError> {
 	let src_ptr = req.arg(src_arg_index as usize) as *const libc::c_char;
 	let src = req.cstr_from_target_memory(src_ptr)?;
-	let src_str = src
-		.into_string()
-		.map_err(|_| AccessRequestError::InvalidSyscallData("invalid UTF-8 in symlink target"))?;
 	Ok((
 		Operation::FsCreate(crate::syscalls::fs::CreateOperation {
 			target: target.clone(),
 			mode: 0o777,
-			kind: CreateKind::Symlink { target: src_str },
+			kind: CreateKind::Symlink { target: src },
 		}),
 		None,
 	))
