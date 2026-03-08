@@ -1,4 +1,4 @@
-use std::ffi::CStr;
+use std::{ffi::CStr, mem::offset_of};
 
 use libseccomp::{ScmpFilterContext, ScmpSyscall};
 
@@ -55,18 +55,23 @@ fn read_unix_target(
 		return Ok(None);
 	}
 
-	// Read the address family (first 2 bytes of sockaddr).
-	let family = req.value_from_target_memory(addr_ptr as *const libc::sa_family_t)?;
+	// Read the address family (first 2 bytes of sockaddr).  We have to do
+	// this separately from reading the path because the target sockaddr
+	// might not in fact be a sockaddr_un, and it might be smaller.  If
+	// the allocated sockaddr is small and crosses a page boundary, we
+	// don't want to read out-of-bound.
+	let family = req.value_from_target_memory(
+		(addr_ptr + offset_of!(libc::sockaddr_un, sun_family)) as *const libc::sa_family_t,
+	)?;
 	if family != libc::AF_UNIX as libc::sa_family_t {
 		return Ok(None);
 	}
 
-	// sun_path starts at offset 2 (right after sa_family_t).
-	let sun_path_ptr = (addr_ptr + 2) as *const libc::c_char;
-
+	let sun_path_ptr = (addr_ptr + offset_of!(libc::sockaddr_un, sun_path)) as *const libc::c_char;
 	let path = req.cstr_from_target_memory(sun_path_ptr)?;
 
-	// Abstract-namespace sockets have an empty sun_path (the first byte is '\0').
+	// Abstract-namespace sockets have a sun_path with the first byte
+	// being NUL, which we will end up reading as an empty string.
 	if path.as_bytes().is_empty() {
 		return Ok(None);
 	}
