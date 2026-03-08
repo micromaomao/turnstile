@@ -312,21 +312,8 @@ fn readlink_fd(fd: libc::c_int) -> Result<String, io::Error> {
 #[derive(Debug)]
 pub struct OpenOperation {
 	pub target: FsTarget,
-	pub flags: libc::c_int,
-}
-
-impl OpenOperation {
-	pub fn has_read(&self) -> bool {
-		(self.flags & libc::O_RDONLY != 0 || self.flags & libc::O_RDWR != 0)
-			&& self.flags & libc::O_WRONLY == 0
-			&& self.flags & libc::O_PATH == 0
-	}
-
-	pub fn has_write(&self) -> bool {
-		(self.flags & libc::O_WRONLY != 0 || self.flags & libc::O_RDWR != 0)
-			&& self.flags & libc::O_RDONLY == 0
-			&& self.flags & libc::O_PATH == 0
-	}
+	pub need_read: bool,
+	pub need_write: bool,
 }
 
 #[derive(Debug)]
@@ -398,27 +385,16 @@ fn handle_open_like(
 			// X_OK alone => execution request.
 			if mode == libc::X_OK as u64 {
 				return Ok((
-					Operation::FsExec(ExecOperation {
-						target: target.clone(),
-					}),
+					Operation::FsExec(ExecOperation { target: target.clone() }),
 					None,
 				));
 			}
-			// Derive open flags from access mode bits.
-			let flags = if mode & libc::R_OK as u64 != 0 && mode & libc::W_OK as u64 != 0 {
-				libc::O_RDWR
-			} else if mode & libc::W_OK as u64 != 0 {
-				libc::O_WRONLY
-			} else if mode & libc::R_OK as u64 != 0 {
-				libc::O_RDONLY
-			} else {
-				// F_OK — existence check only.
-				libc::O_PATH
-			};
+			// Derive read/write intent from access mode bits.
 			return Ok((
 				Operation::FsOpen(OpenOperation {
 					target: target.clone(),
-					flags,
+					need_read: mode & libc::R_OK as u64 != 0,
+					need_write: mode & libc::W_OK as u64 != 0,
 				}),
 				None,
 			));
@@ -427,16 +403,22 @@ fn handle_open_like(
 		return Ok((
 			Operation::FsOpen(OpenOperation {
 				target: target.clone(),
-				flags: libc::O_RDONLY,
+				need_read: true,
+				need_write: false,
 			}),
 			None,
 		));
 	}
 
-	// Open-like syscall: use openat_flags if available, otherwise default to
-	// O_CREAT|O_WRONLY|O_TRUNC (the implicit flags of creat(2)).
+	// Open-like syscall: derive read/write intent from the O_RDONLY / O_WRONLY /
+	// O_RDWR bits.  creat(2) has no explicit flags arg, so default to O_WRONLY.
 	let flags = openat_flags.unwrap_or((libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC) as u64)
 		as libc::c_int;
+
+	let need_read = flags & libc::O_PATH == 0
+		&& (flags & libc::O_RDWR != 0 || flags & libc::O_WRONLY == 0);
+	let need_write = flags & libc::O_PATH == 0
+		&& (flags & libc::O_RDWR != 0 || flags & libc::O_WRONLY != 0);
 
 	// Create if O_CREAT is set, or if there are no openat_flags (creat syscall).
 	let creates = create_mode.is_some() && (flags & libc::O_CREAT != 0 || openat_flags.is_none());
@@ -447,19 +429,10 @@ fn handle_open_like(
 			mode: create_mode.unwrap(),
 			kind: CreateKind::File,
 		});
-		let open_op = Operation::FsOpen(OpenOperation {
-			target: target.clone(),
-			flags,
-		});
+		let open_op = Operation::FsOpen(OpenOperation { target: target.clone(), need_read, need_write });
 		Ok((create_op, Some(open_op)))
 	} else {
-		Ok((
-			Operation::FsOpen(OpenOperation {
-				target: target.clone(),
-				flags,
-			}),
-			None,
-		))
+		Ok((Operation::FsOpen(OpenOperation { target: target.clone(), need_read, need_write }), None))
 	}
 }
 
