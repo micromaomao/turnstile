@@ -369,51 +369,36 @@ type SyscallHandler2 = fn(
 
 // See https://syscalls.mebeim.net
 
+fn handle_access_like(
+	_req: &mut RequestContext,
+	target: &FsTarget,
+	access_mode: u64,
+) -> Result<(Operation, Option<Operation>), AccessRequestError> {
+	use crate::syscalls::fs::{ExecOperation, OpenOperation};
+
+	if access_mode == libc::X_OK as u64 {
+		return Ok((Operation::FsExec(ExecOperation { target: target.clone() }), None));
+	}
+	Ok((
+		Operation::FsOpen(OpenOperation {
+			target: target.clone(),
+			need_read: access_mode & libc::R_OK as u64 != 0,
+			need_write: access_mode & libc::W_OK as u64 != 0,
+		}),
+		None,
+	))
+}
+
 fn handle_open_like(
 	_req: &mut RequestContext,
 	target: &FsTarget,
 	create_mode: Option<libc::mode_t>,
 	openat_flags: Option<u64>,
-	access_mode: Option<u64>,
 	_openat2_resolve: Option<u64>,
 ) -> Result<(Operation, Option<Operation>), AccessRequestError> {
-	use crate::syscalls::fs::{CreateKind, CreateOperation, ExecOperation, OpenOperation};
+	use crate::syscalls::fs::{CreateKind, CreateOperation, OpenOperation};
 
-	// Access/exec check path: no open flags and no create mode.
-	if openat_flags.is_none() && create_mode.is_none() {
-		if let Some(mode) = access_mode {
-			// X_OK alone => execution request.
-			if mode == libc::X_OK as u64 {
-				return Ok((
-					Operation::FsExec(ExecOperation {
-						target: target.clone(),
-					}),
-					None,
-				));
-			}
-			// Derive read/write intent from access mode bits.
-			return Ok((
-				Operation::FsOpen(OpenOperation {
-					target: target.clone(),
-					need_read: mode & libc::R_OK as u64 != 0,
-					need_write: mode & libc::W_OK as u64 != 0,
-				}),
-				None,
-			));
-		}
-		// No access_mode either — treat as a read-only open.
-		return Ok((
-			Operation::FsOpen(OpenOperation {
-				target: target.clone(),
-				need_read: true,
-				need_write: false,
-			}),
-			None,
-		));
-	}
-
-	// Open-like syscall: derive read/write intent from the O_RDONLY / O_WRONLY /
-	// O_RDWR bits.  creat(2) has no explicit flags arg, so default to O_WRONLY.
+	// creat(2) has no explicit flags arg; default to O_CREAT|O_WRONLY|O_TRUNC.
 	let flags = openat_flags.unwrap_or((libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC) as u64)
 		as libc::c_int;
 
@@ -460,7 +445,6 @@ fn handle_openat2(
 		target,
 		Some(open_how.mode as libc::mode_t),
 		Some(open_how.flags),
-		None,
 		Some(open_how.resolve),
 	)
 }
@@ -503,14 +487,13 @@ const FS_SYSCALLS_PATH: &'static [(&'static str, SyscallHandler1, u8)] = &[
 				Some(req.arg(2) as libc::mode_t),
 				Some(req.arg(1)),
 				None,
-				None,
 			)
 		},
 		0,
 	),
 	(
 		"access",
-		|req, target| handle_open_like(req, target, None, None, Some(req.arg(1)), None),
+		|req, target| handle_access_like(req, target, req.arg(1)),
 		0,
 	),
 	(
@@ -548,7 +531,6 @@ const FS_SYSCALLS_PATH: &'static [(&'static str, SyscallHandler1, u8)] = &[
 				Some(req.arg(1) as libc::mode_t),
 				None,
 				None,
-				None,
 			)
 		},
 		0,
@@ -583,7 +565,7 @@ const FS_SYSCALLS_PATH: &'static [(&'static str, SyscallHandler1, u8)] = &[
 	),
 	(
 		"execve",
-		|req, target| handle_open_like(req, target, None, None, Some(libc::X_OK as u64), None),
+		|req, target| handle_access_like(req, target, libc::X_OK as u64),
 		0,
 	),
 	// The "source" of a symlink is arbitrary data, so we don't treat it as a FsTarget.
@@ -609,7 +591,6 @@ const FS_SYSCALLS_DFD_PATH: &'static [(&'static str, SyscallHandler1, u8, u8, Op
 				Some(req.arg(3) as libc::mode_t),
 				Some(req.arg(2)),
 				None,
-				None,
 			)
 		},
 		0,
@@ -619,14 +600,14 @@ const FS_SYSCALLS_DFD_PATH: &'static [(&'static str, SyscallHandler1, u8, u8, Op
 	("openat2", handle_openat2, 0, 1, None),
 	(
 		"faccessat",
-		|req, target| handle_open_like(req, target, None, None, Some(req.arg(2)), None),
+		|req, target| handle_access_like(req, target, req.arg(2)),
 		0,
 		1,
 		Some(3),
 	),
 	(
 		"faccessat2",
-		|req, target| handle_open_like(req, target, None, None, Some(req.arg(2)), None),
+		|req, target| handle_access_like(req, target, req.arg(2)),
 		0,
 		1,
 		Some(3),
@@ -690,7 +671,7 @@ const FS_SYSCALLS_DFD_PATH: &'static [(&'static str, SyscallHandler1, u8, u8, Op
 	),
 	(
 		"execveat",
-		|req, target| handle_open_like(req, target, None, None, Some(libc::X_OK as u64), None),
+		|req, target| handle_access_like(req, target, libc::X_OK as u64),
 		0,
 		1,
 		Some(4),
