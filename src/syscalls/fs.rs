@@ -377,7 +377,12 @@ fn handle_access_like(
 	use crate::syscalls::fs::{ExecOperation, OpenOperation};
 
 	if access_mode == libc::X_OK as u64 {
-		return Ok((Operation::FsExec(ExecOperation { target: target.clone() }), None));
+		return Ok((
+			Operation::FsExec(ExecOperation {
+				target: target.clone(),
+			}),
+			None,
+		));
 	}
 	Ok((
 		Operation::FsOpen(OpenOperation {
@@ -449,28 +454,36 @@ fn handle_openat2(
 	)
 }
 
-fn handle_create_like(
-	req: &mut RequestContext,
+fn handle_mknod_like(
 	target: &FsTarget,
 	mode: libc::mode_t,
 	kind: CreateKind,
-	symlink_from_arg_index: Option<u8>,
 ) -> Result<(Operation, Option<Operation>), AccessRequestError> {
-	let actual_kind = if let Some(idx) = symlink_from_arg_index {
-		let src_ptr = req.arg(idx as usize) as *const libc::c_char;
-		let src = req.cstr_from_target_memory(src_ptr)?;
-		let src_str = src.into_string().map_err(|_| {
-			AccessRequestError::InvalidSyscallData("invalid UTF-8 in symlink target")
-		})?;
-		CreateKind::Symlink { target: src_str }
-	} else {
-		kind
-	};
 	Ok((
 		Operation::FsCreate(crate::syscalls::fs::CreateOperation {
 			target: target.clone(),
 			mode,
-			kind: actual_kind,
+			kind,
+		}),
+		None,
+	))
+}
+
+fn handle_symlink_like(
+	req: &mut RequestContext,
+	target: &FsTarget,
+	src_arg_index: u8,
+) -> Result<(Operation, Option<Operation>), AccessRequestError> {
+	let src_ptr = req.arg(src_arg_index as usize) as *const libc::c_char;
+	let src = req.cstr_from_target_memory(src_ptr)?;
+	let src_str = src
+		.into_string()
+		.map_err(|_| AccessRequestError::InvalidSyscallData("invalid UTF-8 in symlink target"))?;
+	Ok((
+		Operation::FsCreate(crate::syscalls::fs::CreateOperation {
+			target: target.clone(),
+			mode: 0o777,
+			kind: CreateKind::Symlink { target: src_str },
 		}),
 		None,
 	))
@@ -498,15 +511,7 @@ const FS_SYSCALLS_PATH: &'static [(&'static str, SyscallHandler1, u8)] = &[
 	),
 	(
 		"mkdir",
-		|req, target| {
-			handle_create_like(
-				req,
-				target,
-				req.arg(1) as libc::mode_t,
-				CreateKind::Directory,
-				None,
-			)
-		},
+		|req, target| handle_mknod_like(target, req.arg(1) as libc::mode_t, CreateKind::Directory),
 		0,
 	),
 	(
@@ -524,15 +529,7 @@ const FS_SYSCALLS_PATH: &'static [(&'static str, SyscallHandler1, u8)] = &[
 	),
 	(
 		"creat",
-		|req, target| {
-			handle_open_like(
-				req,
-				target,
-				Some(req.arg(1) as libc::mode_t),
-				None,
-				None,
-			)
-		},
+		|req, target| handle_open_like(req, target, Some(req.arg(1) as libc::mode_t), None, None),
 		0,
 	),
 	(
@@ -546,7 +543,7 @@ const FS_SYSCALLS_PATH: &'static [(&'static str, SyscallHandler1, u8)] = &[
 				} else {
 					CreateKind::File
 				};
-			handle_create_like(req, target, mode, kind, None)
+			handle_mknod_like(target, mode, kind)
 		},
 		0,
 	),
@@ -571,7 +568,7 @@ const FS_SYSCALLS_PATH: &'static [(&'static str, SyscallHandler1, u8)] = &[
 	// The "source" of a symlink is arbitrary data, so we don't treat it as a FsTarget.
 	(
 		"symlink",
-		|req, target| handle_create_like(req, target, 0o777, CreateKind::File, Some(0)),
+		|req, target| handle_symlink_like(req, target, 0),
 		1,
 	),
 ];
@@ -615,7 +612,7 @@ const FS_SYSCALLS_DFD_PATH: &'static [(&'static str, SyscallHandler1, u8, u8, Op
 	// The "source" of a symlink is arbitrary data, so we don't treat it as a FsTarget.
 	(
 		"symlinkat",
-		|req, target| handle_create_like(req, target, 0o777, CreateKind::File, Some(0)),
+		|req, target| handle_symlink_like(req, target, 0),
 		1,
 		2,
 		None,
@@ -639,15 +636,7 @@ const FS_SYSCALLS_DFD_PATH: &'static [(&'static str, SyscallHandler1, u8, u8, Op
 	),
 	(
 		"mkdirat",
-		|req, target| {
-			handle_create_like(
-				req,
-				target,
-				req.arg(2) as libc::mode_t,
-				CreateKind::Directory,
-				None,
-			)
-		},
+		|req, target| handle_mknod_like(target, req.arg(2) as libc::mode_t, CreateKind::Directory),
 		0,
 		1,
 		None,
@@ -663,7 +652,7 @@ const FS_SYSCALLS_DFD_PATH: &'static [(&'static str, SyscallHandler1, u8, u8, Op
 				} else {
 					CreateKind::File
 				};
-			handle_create_like(req, target, mode, kind, None)
+			handle_mknod_like(target, mode, kind)
 		},
 		0,
 		1,
