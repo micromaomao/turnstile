@@ -19,7 +19,7 @@ pub enum TurnstileTracerError {
 	#[error("failed to resolve syscall {0}: {1}")]
 	ResolveSyscall(&'static str, libseccomp::error::SeccompError),
 	#[error("failed to add filter rule for {0}: {1}")]
-	AddRule(&'static str, libseccomp::error::SeccompError),
+	AddRule(String, libseccomp::error::SeccompError),
 }
 
 #[derive(Error, Debug)]

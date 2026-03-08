@@ -1,10 +1,10 @@
 use std::{ffi::CStr, mem::offset_of};
 
-use libseccomp::{ScmpFilterContext, ScmpSyscall};
+use libseccomp::ScmpFilterContext;
 
 use crate::{
 	AccessRequest, AccessRequestError, Operation, TurnstileTracerError,
-	syscalls::{RequestContext, fs::ForeignFd, fs::FsTarget, lazy_syscall_table_name_to_number},
+	syscalls::{RequestContext, fs::ForeignFd, fs::FsTarget, lazy_syscall_table_name_to_number, syscall_name_for_error},
 };
 
 /// (name, handler, addr arg index, addrlen arg index).
@@ -26,12 +26,10 @@ lazy_syscall_table_name_to_number!(
 pub(crate) fn add_filter_rules(
 	filter_ctx: &mut ScmpFilterContext,
 ) -> Result<(), TurnstileTracerError> {
-	for &(name, _, _, _) in UNIX_SOCK_SYSCALLS {
-		let scmpc = ScmpSyscall::from_name(name)
-			.map_err(|e| TurnstileTracerError::ResolveSyscall(name, e))?;
+	for &(sys, ..) in unix_sock_syscalls_table() {
 		filter_ctx
-			.add_rule(libseccomp::ScmpAction::Notify, scmpc)
-			.map_err(|e| TurnstileTracerError::AddRule(name, e))?;
+			.add_rule(libseccomp::ScmpAction::Notify, sys)
+			.map_err(|e| TurnstileTracerError::AddRule(syscall_name_for_error(sys), e))?;
 	}
 	Ok(())
 }

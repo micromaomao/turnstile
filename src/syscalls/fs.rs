@@ -4,13 +4,13 @@ use std::{
 	os::unix::io::AsRawFd,
 };
 
-use libseccomp::{ScmpFilterContext, ScmpSyscall};
+use libseccomp::ScmpFilterContext;
 
 use crate::{
 	AccessRequest, AccessRequestError, Operation, TurnstileTracerError, syscalls::RequestContext,
 };
 
-use super::lazy_syscall_table_name_to_number;
+use super::{lazy_syscall_table_name_to_number, syscall_name_for_error};
 
 use log::warn;
 
@@ -712,31 +712,25 @@ const FS_SYSCALLS_DFD_PATH_DFD_PATH: &[(&str, SyscallHandler2, u8, u8, u8, u8, O
 pub(crate) fn add_filter_rules(
 	filter_ctx: &mut ScmpFilterContext,
 ) -> Result<(), TurnstileTracerError> {
-	for list in &[
-		FS_SYSCALLS_PATH
-			.into_iter()
-			.map(|(name, _, _)| *name)
-			.collect::<Vec<_>>(),
-		FS_SYSCALLS_DFD_PATH
-			.into_iter()
-			.map(|(name, _, _, _, _)| *name)
-			.collect::<Vec<_>>(),
-		FS_SYSCALLS_PATH_PATH
-			.into_iter()
-			.map(|(name, _, _, _)| *name)
-			.collect::<Vec<_>>(),
-		FS_SYSCALLS_DFD_PATH_DFD_PATH
-			.into_iter()
-			.map(|(name, _, _, _, _, _, _)| *name)
-			.collect::<Vec<_>>(),
-	] {
-		for name in list {
-			let scmpc = ScmpSyscall::from_name(name)
-				.map_err(|e| TurnstileTracerError::ResolveSyscall(name, e))?;
-			filter_ctx
-				.add_rule(libseccomp::ScmpAction::Notify, scmpc)
-				.map_err(|e| TurnstileTracerError::AddRule(name, e))?;
-		}
+	for &(sys, ..) in fs_syscalls_path_table() {
+		filter_ctx
+			.add_rule(libseccomp::ScmpAction::Notify, sys)
+			.map_err(|e| TurnstileTracerError::AddRule(syscall_name_for_error(sys), e))?;
+	}
+	for &(sys, ..) in fs_syscalls_dfd_path_table() {
+		filter_ctx
+			.add_rule(libseccomp::ScmpAction::Notify, sys)
+			.map_err(|e| TurnstileTracerError::AddRule(syscall_name_for_error(sys), e))?;
+	}
+	for &(sys, ..) in fs_syscalls_path_path_table() {
+		filter_ctx
+			.add_rule(libseccomp::ScmpAction::Notify, sys)
+			.map_err(|e| TurnstileTracerError::AddRule(syscall_name_for_error(sys), e))?;
+	}
+	for &(sys, ..) in fs_syscall_dfd_path_dfd_path_table() {
+		filter_ctx
+			.add_rule(libseccomp::ScmpAction::Notify, sys)
+			.map_err(|e| TurnstileTracerError::AddRule(syscall_name_for_error(sys), e))?;
 	}
 	Ok(())
 }

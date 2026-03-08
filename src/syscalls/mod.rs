@@ -58,6 +58,14 @@ macro_rules! lazy_syscall_table_name_to_number {
 }
 pub(crate) use lazy_syscall_table_name_to_number;
 
+/// Return the name of a syscall for use in error messages.
+///
+/// Falls back to the raw syscall number if the name cannot be resolved.
+pub(crate) fn syscall_name_for_error(sys: libseccomp::ScmpSyscall) -> String {
+	sys.get_name()
+		.unwrap_or_else(|_| format!("{}", sys.as_raw_syscall()))
+}
+
 #[derive(Debug)]
 pub struct RequestContext<'a> {
 	pub(crate) _tracer: &'a TurnstileTracer,
