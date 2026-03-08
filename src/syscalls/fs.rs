@@ -579,7 +579,7 @@ const FS_SYSCALLS_DFD_PATH: &'static [(&'static str, SyscallHandler1, u8, u8, Op
 		|req, target| handle_access_like(req, target, req.arg(2)),
 		0,
 		1,
-		Some(3),
+		None,
 	),
 	(
 		"faccessat2",
