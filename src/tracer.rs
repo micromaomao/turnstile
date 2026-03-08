@@ -188,15 +188,14 @@ impl TurnstileTracer {
 				let scmpctx_ptr = scmpctx_ptr.into_ptr();
 				let rc = libseccomp_sys::seccomp_load(scmpctx_ptr);
 				if rc != 0 {
-					// rc is a libseccomp-specific error code (not an OS errno),
-					// so we cannot meaningfully wrap it in io::Error.  A panic
-					// is appropriate: seccomp_load failing means the filter is
-					// fundamentally broken.
 					panic!("seccomp_load failed with error code {}", rc);
 				}
 				let notify_fd = libseccomp_sys::seccomp_notify_fd(scmpctx_ptr);
 				if notify_fd < 0 {
-					return Err(std::io::Error::last_os_error());
+					panic!(
+						"seccomp_notify_fd failed with error code {}",
+						-1 * notify_fd
+					);
 				}
 
 				// Send notify_fd to the parent via SCM_RIGHTS.
