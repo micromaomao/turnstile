@@ -199,7 +199,7 @@ impl TurnstileTracer {
 				}
 
 				// Send notify_fd to the parent via SCM_RIGHTS.
-				send_fd_via_scm_rights(child_sock, notify_fd)?;
+				unix_send_fd(child_sock, notify_fd)?;
 
 				libc::close(child_sock);
 				libc::close(notify_fd);
@@ -211,10 +211,8 @@ impl TurnstileTracer {
 		}
 
 		let child = cmd.spawn().map_err(TurnstileTracerError::Spawn)?;
-
-		// Receive notify_fd from child via SCM_RIGHTS.
 		let received_fd =
-			recv_fd_via_scm_rights(parent_sock).map_err(TurnstileTracerError::TransferNotifyFd)?;
+			unix_recv_fd(parent_sock).map_err(TurnstileTracerError::TransferNotifyFd)?;
 		unsafe {
 			libc::close(parent_sock);
 		}
@@ -235,7 +233,7 @@ impl SendableContextPtr {
 }
 
 /// Send a file descriptor to another process via a Unix socket using SCM_RIGHTS.
-unsafe fn send_fd_via_scm_rights(sock: libc::c_int, fd: libc::c_int) -> std::io::Result<()> {
+unsafe fn unix_send_fd(sock: libc::c_int, fd: libc::c_int) -> std::io::Result<()> {
 	// Use a [u64] buffer to ensure 8-byte alignment required by cmsghdr.
 	let cmsg_space =
 		unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as libc::c_uint) as usize };
@@ -259,7 +257,7 @@ unsafe fn send_fd_via_scm_rights(sock: libc::c_int, fd: libc::c_int) -> std::io:
 		if cmsg.is_null() {
 			// io::Error::new() allocates and is not safe in a pre_exec context;
 			// this branch is unreachable since we sized the buffer correctly above.
-			panic!("CMSG_FIRSTHDR returned null — control message buffer too small");
+			panic!("CMSG_FIRSTHDR returned null");
 		}
 		(*cmsg).cmsg_level = libc::SOL_SOCKET;
 		(*cmsg).cmsg_type = libc::SCM_RIGHTS;
@@ -277,7 +275,7 @@ unsafe fn send_fd_via_scm_rights(sock: libc::c_int, fd: libc::c_int) -> std::io:
 }
 
 /// Receive a file descriptor sent via SCM_RIGHTS over a Unix socket.
-fn recv_fd_via_scm_rights(sock: libc::c_int) -> std::io::Result<libc::c_int> {
+fn unix_recv_fd(sock: libc::c_int) -> std::io::Result<libc::c_int> {
 	let cmsg_space =
 		unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as libc::c_uint) as usize };
 	let num_u64s = (cmsg_space + 7) / 8;

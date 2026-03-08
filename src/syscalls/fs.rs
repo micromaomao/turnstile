@@ -359,12 +359,7 @@ fn handle_access_like(
 	access_mode: u64,
 ) -> Result<(Operation, Option<Operation>), AccessRequestError> {
 	if access_mode == libc::X_OK as u64 {
-		return Ok((
-			Operation::FsExec(ExecOperation {
-				target,
-			}),
-			None,
-		));
+		return Ok((Operation::FsExec(ExecOperation { target }), None));
 	}
 	Ok((
 		Operation::FsOpen(OpenOperation {
@@ -442,11 +437,7 @@ fn handle_mknod_like(
 	kind: CreateKind,
 ) -> Result<(Operation, Option<Operation>), AccessRequestError> {
 	Ok((
-		Operation::FsCreate(crate::syscalls::fs::CreateOperation {
-			target,
-			mode,
-			kind,
-		}),
+		Operation::FsCreate(crate::syscalls::fs::CreateOperation { target, mode, kind }),
 		None,
 	))
 }
@@ -469,7 +460,7 @@ fn handle_symlink_like(
 }
 
 // (name, handler, arg index of the path)
-const FS_SYSCALLS_PATH: &'static [(&'static str, SyscallHandler1, u8)] = &[
+const FS_SYSCALLS_PATH: &[(&str, SyscallHandler1, u8)] = &[
 	(
 		"open",
 		|req, target| {
@@ -497,10 +488,7 @@ const FS_SYSCALLS_PATH: &'static [(&'static str, SyscallHandler1, u8)] = &[
 		"rmdir",
 		|_req, target| {
 			Ok((
-				Operation::FsUnlink(crate::syscalls::fs::UnlinkOperation {
-					target,
-					dir: true,
-				}),
+				Operation::FsUnlink(crate::syscalls::fs::UnlinkOperation { target, dir: true }),
 				None,
 			))
 		},
@@ -530,10 +518,7 @@ const FS_SYSCALLS_PATH: &'static [(&'static str, SyscallHandler1, u8)] = &[
 		"unlink",
 		|_req, target| {
 			Ok((
-				Operation::FsUnlink(crate::syscalls::fs::UnlinkOperation {
-					target,
-					dir: false,
-				}),
+				Operation::FsUnlink(crate::syscalls::fs::UnlinkOperation { target, dir: false }),
 				None,
 			))
 		},
@@ -557,7 +542,7 @@ const FS_SYSCALLS_PATH: &'static [(&'static str, SyscallHandler1, u8)] = &[
 // The flags field records where to find AT_EMPTY_PATH / AT_SYMLINK_NOFOLLOW
 // in the syscall arguments (a non-None value means that arg index holds
 // the AT_* flags bitmask; None means no such flags are present).
-const FS_SYSCALLS_DFD_PATH: &'static [(&'static str, SyscallHandler1, u8, u8, Option<u8>)] = &[
+const FS_SYSCALLS_DFD_PATH: &[(&str, SyscallHandler1, u8, u8, Option<u8>)] = &[
 	(
 		"openat",
 		|req, target| {
@@ -602,10 +587,7 @@ const FS_SYSCALLS_DFD_PATH: &'static [(&'static str, SyscallHandler1, u8, u8, Op
 			let flags = req.arg(2);
 			let dir = flags & libc::AT_REMOVEDIR as u64 != 0;
 			Ok((
-				Operation::FsUnlink(crate::syscalls::fs::UnlinkOperation {
-					target,
-					dir,
-				}),
+				Operation::FsUnlink(crate::syscalls::fs::UnlinkOperation { target, dir }),
 				None,
 			))
 		},
@@ -646,7 +628,7 @@ const FS_SYSCALLS_DFD_PATH: &'static [(&'static str, SyscallHandler1, u8, u8, Op
 	),
 ];
 // (name, handler, arg index of the first path, arg index of the second path)
-const FS_SYSCALLS_PATH_PATH: &'static [(&'static str, SyscallHandler2, u8, u8)] = &[
+const FS_SYSCALLS_PATH_PATH: &[(&str, SyscallHandler2, u8, u8)] = &[
 	(
 		"rename",
 		|_req, target1, target2| {
@@ -682,15 +664,7 @@ const FS_SYSCALLS_PATH_PATH: &'static [(&'static str, SyscallHandler2, u8, u8)] 
 //
 // The flags field records where to find AT_EMPTY_PATH / AT_SYMLINK_NOFOLLOW
 // flags that apply to the first (source) path.
-const FS_SYSCALLS_DFD_PATH_DFD_PATH: &'static [(
-	&'static str,
-	SyscallHandler2,
-	u8,
-	u8,
-	u8,
-	u8,
-	Option<u8>,
-)] = &[
+const FS_SYSCALLS_DFD_PATH_DFD_PATH: &[(&str, SyscallHandler2, u8, u8, u8, u8, Option<u8>)] = &[
 	(
 		"renameat",
 		|_req, target1, target2| {

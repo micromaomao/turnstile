@@ -7,13 +7,12 @@ use crate::{
 	syscalls::{RequestContext, fs::ForeignFd, fs::FsTarget, lazy_syscall_table_name_to_number},
 };
 
-/// Unix socket syscalls to intercept:
-/// (name, operation builder, addr arg index, addrlen arg index).
+/// (name, handler, addr arg index, addrlen arg index).
 const UNIX_SOCK_SYSCALLS: &[(&str, fn(FsTarget) -> Operation, u8, u8)] = &[
-	("connect", |t| Operation::UnixConnect(t), 1, 2),
-	("bind", |t| Operation::UnixListen(t), 1, 2),
-	("sendto", |t| Operation::UnixSendto(t), 4, 5),
-	("recvfrom", |t| Operation::UnixRecvfrom(t), 4, 5),
+	("connect", Operation::UnixConnect, 1, 2),
+	("bind", Operation::UnixListen, 1, 2),
+	("sendto", Operation::UnixSendto, 4, 5),
+	("recvfrom", Operation::UnixRecvfrom, 4, 5),
 ];
 
 lazy_syscall_table_name_to_number!(
@@ -37,10 +36,9 @@ pub(crate) fn add_filter_rules(
 	Ok(())
 }
 
-/// Try to read a Unix socket target from the traced process's memory.
-/// Returns `None` if the address is null, too short, or is an abstract-
-/// namespace socket (no filesystem path).
-fn read_unix_target(
+/// Try to read a Unix socket path from a sockaddr pointer in the target
+/// process.
+fn read_sockaddr_un(
 	req: &mut RequestContext,
 	addr_arg: usize,
 	addrlen_arg: usize,
@@ -106,7 +104,7 @@ pub(crate) fn handle_notification<'a>(
 			continue;
 		}
 		if let Some(target) =
-			read_unix_target(request_ctx, addr_arg as usize, addrlen_arg as usize)?
+			read_sockaddr_un(request_ctx, addr_arg as usize, addrlen_arg as usize)?
 		{
 			let op = builder(target);
 			return Ok(Some(AccessRequest {

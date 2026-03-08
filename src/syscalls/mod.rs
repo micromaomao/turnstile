@@ -1,4 +1,4 @@
-use std::{ffi::CStr, io};
+use std::{ffi::CStr, io, mem::MaybeUninit, slice};
 
 use libseccomp::{ScmpFd, ScmpNotifReq, ScmpNotifResp, ScmpNotifRespFlags};
 use log::warn;
@@ -32,18 +32,9 @@ macro_rules! syscall_transform_tuple {
 
 pub(crate) use syscall_transform_tuple;
 
-/// Lazily resolves a syscall-name table into a `ScmpSyscall`-keyed `Vec`,
-/// built once via `OnceLock`.
-///
-/// Usage:
-/// ```ignore
-/// lazy_syscall_table_name_to_number!(TABLE, fn_name, Type1, Type2, ...);
-/// ```
-/// Generates `fn fn_name() -> &'static Vec<(ScmpSyscall, Type1, Type2, ...)>`.
-/// The source table must be `&[(&str, Type1, Type2, ...)]` where the leading
-/// `&str` is the syscall name; it is resolved to a `ScmpSyscall` number and
-/// entries whose name cannot be resolved are silently dropped (e.g. on
-/// architectures that don't have that syscall).
+/// Resolve all syscall names in a table into their `ScmpSyscall` value
+/// for the native architecture.  Entries whose name cannot be resolved
+/// are dropped.
 macro_rules! lazy_syscall_table_name_to_number {
 	($table:expr, $fn_name:ident, $($t:ty),*) => {
 		fn $fn_name() -> &'static Vec<(libseccomp::ScmpSyscall, $($t),*)> {
@@ -181,7 +172,7 @@ impl<'a> RequestContext<'a> {
 			));
 		}
 
-		// Second read: one more full page, appended directly to buf.
+		// Second read: one more full page appended to buf
 		let second_addr = first_end;
 		let old_len = buf.len();
 		buf.reserve_exact(page_sz);
@@ -230,9 +221,8 @@ impl<'a> RequestContext<'a> {
 	}
 
 	/// Reads the syscall argument at `fd_arg_index` and opens it as a
-	/// `ForeignFd` via `/proc/{pid}/...`.  Handles `AT_FDCWD` (→ cwd),
-	/// non-negative fds (→ `/proc/{pid}/fd/{fd}`), and returns an error for
-	/// negative non-`AT_FDCWD` values or values that don't fit in `c_int`.
+	/// `ForeignFd` via `/proc/{pid}/...`.  Does error checking and
+	/// handles AT_FDCWD.
 	pub(crate) fn arg_to_fd(
 		&mut self,
 		fd_arg_index: usize,
@@ -253,17 +243,16 @@ impl<'a> RequestContext<'a> {
 		}
 	}
 
-	pub(crate) fn value_from_target_memory<T: Copy>(
+	pub(crate) fn read_target_memory(
 		&mut self,
-		src: *const T,
-	) -> Result<T, AccessRequestError> {
-		let size = std::mem::size_of::<T>();
-		let mut val = std::mem::MaybeUninit::<T>::uninit();
+		src: *const u8,
+		buf: &mut [MaybeUninit<u8>],
+	) -> Result<(), AccessRequestError> {
 		let ret = unsafe {
 			libc::pread(
 				self.mem_fd.as_raw_fd(),
-				val.as_mut_ptr() as *mut libc::c_void,
-				size,
+				buf.as_mut_ptr() as *mut libc::c_void,
+				buf.len(),
 				src as libc::off_t,
 			)
 		};
@@ -273,16 +262,33 @@ impl<'a> RequestContext<'a> {
 				io::Error::last_os_error(),
 			));
 		}
-		if ret as usize != size {
+		if ret as usize != buf.len() {
 			warn!(
 				"Short read from /proc/{}/mem: expected {} bytes, got {}",
-				self.sreq.pid, size, ret
+				self.sreq.pid,
+				buf.len(),
+				ret
 			);
 			return Err(AccessRequestError::ShortReadProcessMemory(
 				self.sreq.pid,
-				size,
+				buf.len(),
 				ret as usize,
 			));
+		}
+		Ok(())
+	}
+
+	pub(crate) fn value_from_target_memory<T: Copy>(
+		&mut self,
+		src: *const T,
+	) -> Result<T, AccessRequestError> {
+		let size = std::mem::size_of::<T>();
+		let mut val = std::mem::MaybeUninit::<T>::uninit();
+		{
+			let buf = unsafe {
+				slice::from_raw_parts_mut(val.as_mut_ptr() as *mut MaybeUninit<u8>, size)
+			};
+			self.read_target_memory(src as *const u8, buf)?;
 		}
 		Ok(unsafe { val.assume_init() })
 	}
