@@ -257,11 +257,15 @@ impl FsTarget {
 				.dfd
 				.as_ref()
 				.expect("Expected dfd to exist for non-absolute path");
-			return readlink_fd(dfd.as_raw_fd());
+			return readlink_fd(dfd.as_raw_fd())?
+				.into_string()
+				.map_err(|_| io::Error::from_raw_os_error(libc::EILSEQ));
 		}
 
 		let (dir_fd, file_name) = self.open_target_dir()?;
-		let mut result = readlink_fd(dir_fd.as_raw_fd())?;
+		let mut result = readlink_fd(dir_fd.as_raw_fd())?
+			.into_string()
+			.map_err(|_| io::Error::from_raw_os_error(libc::EILSEQ))?;
 		let file_name_bytes = file_name.to_bytes();
 		if !file_name_bytes.is_empty() {
 			result.push('/');
@@ -275,12 +279,14 @@ impl FsTarget {
 }
 
 /// Read the real path of an open O_PATH file descriptor via /proc/self/fd.
-fn readlink_fd(fd: libc::c_int) -> Result<String, io::Error> {
-	let proc_path = CString::new(format!("/proc/self/fd/{}", fd)).unwrap();
+fn readlink_fd(fd: libc::c_int) -> Result<CString, io::Error> {
+	// /proc/self/fd/{fd} is always valid ASCII, so a format! string with a
+	// manual NUL terminator is safe to pass to readlink.
+	let proc_path = format!("/proc/self/fd/{}\0", fd);
 	let mut buf = vec![0u8; libc::PATH_MAX as usize];
 	let ret = unsafe {
 		libc::readlink(
-			proc_path.as_ptr(),
+			proc_path.as_ptr() as *const libc::c_char,
 			buf.as_mut_ptr() as *mut libc::c_char,
 			buf.len(),
 		)
@@ -289,7 +295,9 @@ fn readlink_fd(fd: libc::c_int) -> Result<String, io::Error> {
 		return Err(io::Error::last_os_error());
 	}
 	buf.truncate(ret as usize);
-	String::from_utf8(buf).map_err(|_| io::Error::from_raw_os_error(libc::EILSEQ))
+	// readlink does not include a NUL terminator and Linux paths cannot
+	// contain NUL bytes, so CString::new cannot fail here.
+	Ok(CString::new(buf).expect("readlink result should not contain NUL bytes"))
 }
 
 #[derive(Debug)]

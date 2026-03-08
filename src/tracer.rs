@@ -187,6 +187,8 @@ impl TurnstileTracer {
 				let scmpctx_ptr = scmpctx_ptr.into_ptr();
 				let rc = libseccomp_sys::seccomp_load(scmpctx_ptr);
 				if rc != 0 {
+					// from_raw_os_error stores a plain i32 (Repr::Os) and does
+					// not allocate, so it is safe to call in this pre_exec context.
 					return Err(std::io::Error::from_raw_os_error(-rc));
 				}
 				let notify_fd = libseccomp_sys::seccomp_notify_fd(scmpctx_ptr);
@@ -253,10 +255,9 @@ unsafe fn send_fd_via_scm_rights(sock: libc::c_int, fd: libc::c_int) -> std::io:
 	unsafe {
 		let cmsg = libc::CMSG_FIRSTHDR(&msg);
 		if cmsg.is_null() {
-			return Err(std::io::Error::new(
-				std::io::ErrorKind::InvalidData,
-				"CMSG_FIRSTHDR returned null — control message buffer too small",
-			));
+			// io::Error::new() allocates and is not safe in a pre_exec context;
+			// this branch is unreachable since we sized the buffer correctly above.
+			panic!("CMSG_FIRSTHDR returned null — control message buffer too small");
 		}
 		(*cmsg).cmsg_level = libc::SOL_SOCKET;
 		(*cmsg).cmsg_type = libc::SCM_RIGHTS;

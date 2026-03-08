@@ -40,4 +40,6 @@ pub enum AccessRequestError {
 	InvalidSyscallData(&'static str),
 	#[error("Failed to open {0}: {1}")]
 	OpenFd(String, std::io::Error),
+	#[error("Short read from /proc/{0}/mem: expected {1} bytes, got {2}")]
+	ShortReadProcessMemory(u32, usize, usize),
 }

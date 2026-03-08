@@ -143,7 +143,13 @@ impl<'a> RequestContext<'a> {
 		// First read: from addr to the end of the current page.
 		let first_end = (addr + PAGE_SIZE) & !(PAGE_SIZE - 1);
 		let first_len = first_end - addr;
-		let mut buf = vec![0u8; first_len];
+		// Avoid zero-initializing: pread will fill the bytes and we'll truncate
+		// to the actual number read before inspecting the buffer.
+		let mut buf: Vec<u8> = Vec::new();
+		buf.reserve_exact(first_len);
+		// Safety: the bytes are written by pread before we inspect them, and we
+		// truncate to the number of bytes actually written immediately after.
+		unsafe { buf.set_len(first_len) };
 
 		let ret = unsafe {
 			libc::pread(
@@ -163,13 +169,31 @@ impl<'a> RequestContext<'a> {
 
 		if let Some(nul) = buf.iter().position(|&b| b == 0) {
 			buf.truncate(nul);
-			return std::ffi::CString::new(buf)
-				.map_err(|_| AccessRequestError::InvalidSyscallData("interior NUL byte in path"));
+			// buf has been truncated at the NUL position; no interior NUL is possible.
+			return Ok(
+				std::ffi::CString::new(buf).expect("buf should not have NUL bytes in the middle")
+			);
+		}
+
+		if (ret as usize) < first_len {
+			warn!(
+				"Short read from /proc/{}/mem: expected {} bytes, got {}",
+				self.sreq.pid, first_len, ret
+			);
+			return Err(AccessRequestError::ShortReadProcessMemory(
+				self.sreq.pid,
+				first_len,
+				ret as usize,
+			));
 		}
 
 		// Second read: one more full page.
 		let second_addr = first_end;
-		let mut buf2 = vec![0u8; PAGE_SIZE];
+		let mut buf2: Vec<u8> = Vec::new();
+		buf2.reserve_exact(PAGE_SIZE);
+		// Safety: same as above — pread fills these bytes before we read them.
+		unsafe { buf2.set_len(PAGE_SIZE) };
+
 		let ret = unsafe {
 			libc::pread(
 				self.mem_fd.as_raw_fd(),
@@ -188,8 +212,23 @@ impl<'a> RequestContext<'a> {
 
 		if let Some(nul) = buf2.iter().position(|&b| b == 0) {
 			buf.extend_from_slice(&buf2[..nul]);
-			return std::ffi::CString::new(buf)
-				.map_err(|_| AccessRequestError::InvalidSyscallData("interior NUL byte in path"));
+			// Neither buf (no NUL found in first page) nor buf2[..nul] contains
+			// a NUL byte, so CString::new cannot fail here.
+			return Ok(
+				std::ffi::CString::new(buf).expect("buf should not have NUL bytes in the middle")
+			);
+		}
+
+		if (ret as usize) < PAGE_SIZE {
+			warn!(
+				"Short read from /proc/{}/mem: expected {} bytes, got {}",
+				self.sreq.pid, PAGE_SIZE, ret
+			);
+			return Err(AccessRequestError::ShortReadProcessMemory(
+				self.sreq.pid,
+				PAGE_SIZE,
+				ret as usize,
+			));
 		}
 
 		Err(AccessRequestError::InvalidSyscallData(
@@ -240,8 +279,14 @@ impl<'a> RequestContext<'a> {
 			));
 		}
 		if ret as usize != size {
-			return Err(AccessRequestError::InvalidSyscallData(
-				"short read from process memory",
+			warn!(
+				"Short read from /proc/{}/mem: expected {} bytes, got {}",
+				self.sreq.pid, size, ret
+			);
+			return Err(AccessRequestError::ShortReadProcessMemory(
+				self.sreq.pid,
+				size,
+				ret as usize,
 			));
 		}
 		Ok(unsafe { val.assume_init() })
