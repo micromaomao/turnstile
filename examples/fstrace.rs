@@ -1,9 +1,11 @@
-use std::io::Write;
-use std::process::Command;
+use std::process::{Child, Command};
+use std::sync::Arc;
+use std::thread;
 use std::time::SystemTime;
+use std::{io::Write, sync::Mutex};
 
 use clap::Parser;
-use libturnstile::{Operation, TurnstileTracer};
+use libturnstile::{Operation, TurnstileTracer, TurnstileTracerError};
 use log::info;
 
 /// Trace file operations of a program using libturnstile
@@ -51,17 +53,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 		None => Box::new(std::io::stderr()),
 	};
 
-	let mut tracer = TurnstileTracer::new()?;
+	let mut tracer_box = Arc::new(Mutex::new(TurnstileTracer::new()?));
 
 	let program = &cli.command[0];
 	let args = &cli.command[1..];
 	let mut cmd = Command::new(program);
 	cmd.args(args);
 
-	let mut child = tracer.run_command(&mut cmd)?;
-	info!("Started child process with pid {}", child.id());
+	let mut child_box: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
+	let mut error_box: Arc<Mutex<Option<TurnstileTracerError>>> = Arc::new(Mutex::new(None));
+
+	// We need to have started monitoring and responding to events before
+	// the execve even happens, so we need to do this in a separate
+	// thread.
+	let child_box_for_thread = Arc::clone(&child_box);
+	let error_box_for_thread = Arc::clone(&error_box);
+	let tracer_box_for_thread = Arc::clone(&tracer_box);
+	let child_spawn_jh = thread::spawn(move || {
+		let mut tracer = tracer_box_for_thread.lock().unwrap();
+		match tracer.run_command(&mut cmd) {
+			Ok(child) => {
+				info!("Started child process with pid {}", child.id());
+				child_box_for_thread.lock().unwrap().replace(child);
+			}
+			Err(e) => {
+				error_box_for_thread.lock().unwrap().replace(e);
+				return;
+			}
+		};
+	});
 
 	loop {
+		let tracer = tracer_box.lock().unwrap();
 		match tracer.yield_request() {
 			Ok(Some((access_request, mut ctx))) => {
 				for op in &access_request {
@@ -74,14 +97,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 				// file operation we care about), nothing to report.
 			}
 			Err(e) => {
-				if child.try_wait()?.is_some() {
-					break;
-				}
 				eprintln!("fstrace: error: {}", e);
 			}
 		}
+		if let Some(child) = child_box.lock().unwrap().as_mut() {
+			if let Some(wait_res) = child.try_wait()? {
+				eprintln!("fstrace: child process exited with status {}", wait_res);
+				std::process::exit(wait_res.code().unwrap_or(1));
+			}
+		}
+		if let Some(err) = error_box.lock().unwrap().take() {
+			eprintln!("fstrace: error spawning child: {}", err);
+			std::process::exit(1);
+		}
 	}
-
-	let status = child.wait()?;
-	std::process::exit(status.code().unwrap_or(1));
 }

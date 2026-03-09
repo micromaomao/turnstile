@@ -44,6 +44,9 @@ pub struct TurnstileTracer {
 	pub notify_fd: Option<ScmpFd>,
 }
 
+unsafe impl Send for TurnstileTracer {}
+unsafe impl Sync for TurnstileTracer {}
+
 impl TurnstileTracer {
 	pub fn new() -> Result<Self, TurnstileTracerError> {
 		let mut filter_ctx = ScmpFilterContext::new(libseccomp::ScmpAction::Allow)
