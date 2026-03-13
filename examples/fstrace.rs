@@ -68,10 +68,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 		match tracer_arc_for_thread.run_command(&mut cmd) {
 			Ok(mut child) => {
 				info!("Started child process with pid {}", child.id());
-				if let Some(wait_res) = child.try_wait().unwrap() {
-					eprintln!("fstrace: child process exited with status {}", wait_res);
-					std::process::exit(wait_res.code().unwrap_or(1));
-				}
+				let wait_res = child.wait().unwrap();
+				eprintln!("fstrace: child process exited with status {}", wait_res);
+				std::process::exit(wait_res.code().unwrap_or(1));
 			}
 			Err(e) => {
 				eprintln!("fstrace: error spawning child: {}", e);
