@@ -250,6 +250,10 @@ impl FsTarget {
 				// caller.  Should it need the full path it can always
 				// realpath().
 				b"\0" => CStr::from_bytes_with_nul(b".\0").unwrap(),
+				other if other.first().copied() == Some(b'/') => {
+					// Absolute path with a single filename, remove leading /
+					CStr::from_bytes_with_nul(&other[1..]).unwrap()
+				}
 				other => CStr::from_bytes_with_nul(other).unwrap(),
 			};
 			let actual_parent_fd = match &self.dfd {
@@ -285,7 +289,9 @@ impl FsTarget {
 			return Ok(dir_path);
 		}
 		let mut result = dir_path.into_bytes();
-		result.push(b'/');
+		if result.last().copied() != Some(b'/') {
+			result.push(b'/');
+		}
 		result.extend_from_slice(file_name_bytes);
 		// Neither readlink results nor CStr file-name bytes can contain NUL,
 		// so CString::new cannot fail here.
