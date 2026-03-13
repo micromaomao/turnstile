@@ -184,7 +184,9 @@ impl FsTarget {
 	pub fn open_target_dir(&self) -> Result<(ForeignFd, &CStr), io::Error> {
 		let path_bytes_nul = self.path.to_bytes_with_nul();
 
-		if let Some(last_slash) = path_bytes_nul.iter().rposition(|&b| b == b'/') {
+		if let Some(last_slash) = path_bytes_nul.iter().rposition(|&b| b == b'/')
+			&& last_slash != 0
+		{
 			let dir_bytes = &path_bytes_nul[..last_slash];
 			let file_bytes_nul = &path_bytes_nul[last_slash + 1..];
 			let actual_parent_fd_raw = match &self.dfd {
@@ -200,7 +202,6 @@ impl FsTarget {
 					)
 				},
 				None => {
-					assert!(dir_bytes.starts_with(b"/"));
 					// We have to allocate a new CString to have NUL at the end
 					unsafe {
 						libc::open(
