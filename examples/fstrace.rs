@@ -21,7 +21,7 @@ struct Cli {
 	timestamps: bool,
 
 	/// Program to trace and its arguments
-	#[arg(required = true, allow_hyphen_values = true)]
+	#[arg(required = true)]
 	command: Vec<String>,
 }
 
@@ -67,8 +67,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	loop {
 		match tracer_arc.yield_request() {
 			Ok(Some((access_request, mut ctx))) => {
+				if cli.timestamps {
+					let now = std::time::SystemTime::now();
+					let datetime: chrono::DateTime<chrono::Local> = now.into();
+					write!(output, "[{}] ", datetime.format("%Y-%m-%d %H:%M:%S%.3f"))?;
+				}
+				let pid = ctx.sreq().pid;
+				let comm = std::fs::read(format!("/proc/{}/comm", pid))
+					.map(|r| String::from_utf8_lossy(&r).trim().to_string())
+					.unwrap_or_else(|_| String::from("???"));
 				for op in &access_request {
-					writeln!(output, "{}", op)?;
+					writeln!(output, "{}[{}] {}", comm, pid, op)?;
 				}
 				ctx.send_continue()?;
 			}
