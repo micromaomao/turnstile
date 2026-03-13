@@ -223,19 +223,20 @@ impl FsTarget {
 						0,
 					)
 				},
-				None => {
+				None => unsafe {
 					// We have to allocate a new CString to have NUL at the end
-					unsafe {
-						libc::open(
-							CString::new(dir_bytes)
-								.expect("self.path should not have NUL in the middle")
-								.as_ptr(),
-							libc::O_PATH | libc::O_CLOEXEC | libc::O_DIRECTORY,
-							0,
-						)
-					}
-				}
+					libc::open(
+						CString::new(dir_bytes)
+							.expect("self.path should not have NUL in the middle")
+							.as_ptr(),
+						libc::O_PATH | libc::O_CLOEXEC | libc::O_DIRECTORY,
+						0,
+					)
+				},
 			};
+			if actual_parent_fd_raw < 0 {
+				return Err(io::Error::last_os_error());
+			}
 			let file_name = CStr::from_bytes_with_nul(file_bytes_nul).unwrap();
 			Ok((
 				ForeignFd {
