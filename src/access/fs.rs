@@ -441,3 +441,9 @@ pub struct LinkOperation {
 pub struct ExecOperation {
 	pub target: FsTarget,
 }
+
+#[derive(Debug)]
+pub struct StatOperation {
+	pub target: FsTarget,
+	pub lstat: bool,
+}

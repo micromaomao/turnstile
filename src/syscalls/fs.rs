@@ -6,7 +6,7 @@ use crate::{
 		CreateKind, CreateOperation, ExecOperation, FsTarget, LinkOperation, OpenOperation,
 		RenameOperation, UnlinkOperation,
 	},
-	fs::AccessOperation,
+	fs::{AccessOperation, StatOperation},
 	syscalls::RequestContext,
 };
 
@@ -150,6 +150,14 @@ fn handle_chdir_like(
 	Ok((Operation::FsChdir(target), None))
 }
 
+fn handle_stat_like(
+	_req: &mut RequestContext,
+	target: FsTarget,
+	lstat: bool,
+) -> Result<(Operation, Option<Operation>), AccessRequestError> {
+	Ok((Operation::FsStat(StatOperation { target, lstat }), None))
+}
+
 // (name, handler, arg index of the path)
 const FS_SYSCALLS_PATH: &[(&str, SyscallHandler1, u8)] = &[
 	(
@@ -224,6 +232,26 @@ const FS_SYSCALLS_PATH: &[(&str, SyscallHandler1, u8)] = &[
 	),
 	("readlink", handle_readlink_like, 0),
 	("chdir", handle_chdir_like, 0),
+	(
+		"newstat",
+		|req, target| handle_stat_like(req, target, false),
+		0,
+	),
+	(
+		"newlstat",
+		|req, target| handle_stat_like(req, target, true),
+		0,
+	),
+	(
+		"stat",
+		|req, target| handle_stat_like(req, target, false),
+		0,
+	),
+	(
+		"lstat",
+		|req, target| handle_stat_like(req, target, true),
+		0,
+	),
 ];
 
 // (name, handler, arg index of the dfd, arg index of the path, arg index of AT_* flags or None if no such flag)
@@ -306,6 +334,23 @@ const FS_SYSCALLS_DFD_PATH: &[(&str, SyscallHandler1, u8, u8, Option<u8>)] = &[
 	),
 	("execveat", handle_exec_like, 0, 1, Some(4)),
 	("readlinkat", handle_readlink_like, 0, 1, None),
+	(
+		"newfstatat",
+		|req, target| handle_stat_like(req, target, false),
+		0,
+		1,
+		Some(3),
+	),
+	(
+		"statx",
+		|req, target| {
+			let lstat = req.arg(2) & libc::AT_SYMLINK_NOFOLLOW as u64 != 0;
+			handle_stat_like(req, target, lstat)
+		},
+		0,
+		1,
+		Some(2),
+	),
 ];
 // (name, handler, arg index of the first path, arg index of the second path)
 const FS_SYSCALLS_PATH_PATH: &[(&str, SyscallHandler2, u8, u8)] = &[
@@ -402,7 +447,19 @@ const FS_SYSCALLS_DFD_PATH_DFD_PATH: &[(&str, SyscallHandler2, u8, u8, u8, u8, O
 ];
 
 // (name, handler, fd)
-const FS_SYSCALLS_FD: &[(&str, SyscallHandler1, u8)] = &[("fchdir", handle_chdir_like, 0)];
+const FS_SYSCALLS_FD: &[(&str, SyscallHandler1, u8)] = &[
+	("fchdir", handle_chdir_like, 0),
+	(
+		"newfstat",
+		|req, target| handle_stat_like(req, target, false),
+		0,
+	),
+	(
+		"fstat",
+		|req, target| handle_stat_like(req, target, false),
+		0,
+	),
+];
 
 pub(crate) fn add_filter_rules(
 	filter_ctx: &mut ScmpFilterContext,
