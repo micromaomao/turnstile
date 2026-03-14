@@ -258,8 +258,8 @@ impl TurnstileTracer {
 
 		thread::scope(|s| -> Result<std::process::Child, TurnstileTracerError> {
 			let jh = s.spawn(|| -> Result<(), TurnstileTracerError> {
-				let received_fd = unix_recv_fd(parent_sock)
-					.map_err(TurnstileTracerError::ReceiveNotifyFd)?;
+				let received_fd =
+					unix_recv_fd(parent_sock).map_err(TurnstileTracerError::ReceiveNotifyFd)?;
 				self.notify_fd
 					.set(received_fd)
 					.unwrap_or_else(|_| panic!("Seccomp filters already loaded"));

@@ -45,10 +45,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	// seccomp-unotify, so we must be processing notifications on the main
 	// thread via yield_request before spawn can return.
 	let tracer_for_thread = Arc::clone(&tracer);
-	let spawn_handle = std::thread::spawn(move || -> Result<std::process::Child, Box<dyn std::error::Error + Send + Sync>> {
-		let child = tracer_for_thread.run_command(&mut cmd)?;
-		Ok(child)
-	});
+	let spawn_handle = std::thread::spawn(
+		move || -> Result<std::process::Child, Box<dyn std::error::Error + Send + Sync>> {
+			let child = tracer_for_thread.run_command(&mut cmd)?;
+			Ok(child)
+		},
+	);
 
 	loop {
 		match tracer.yield_request() {
