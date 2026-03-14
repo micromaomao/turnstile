@@ -175,12 +175,22 @@ impl FsTarget {
 		})
 	}
 
+	pub(crate) fn from_fd(
+		req: &mut RequestContext,
+		fd_arg_index: u8,
+	) -> Result<Self, AccessRequestError> {
+		let fd = req.arg_to_fd(fd_arg_index as usize)?;
+		Ok(Self {
+			dfd: Some(fd),
+			path: CString::from(c""),
+			no_follow: false,
+		})
+	}
+
 	/// Opens the target with O_PATH.  This requires the path to actually
 	/// be pointing to an existing file or directory.
 	pub fn open_target(&self) -> Result<ForeignFd, io::Error> {
-		let path_bytes = self.path.to_bytes();
-
-		if path_bytes.is_empty() {
+		if self.path.is_empty() {
 			let dfd = self
 				.dfd
 				.as_ref()

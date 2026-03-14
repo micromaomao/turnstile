@@ -136,6 +136,20 @@ fn handle_symlink_like(
 	))
 }
 
+fn handle_readlink_like(
+	_req: &mut RequestContext,
+	target: FsTarget,
+) -> Result<(Operation, Option<Operation>), AccessRequestError> {
+	Ok((Operation::FsReadlink(target), None))
+}
+
+fn handle_chdir_like(
+	_req: &mut RequestContext,
+	target: FsTarget,
+) -> Result<(Operation, Option<Operation>), AccessRequestError> {
+	Ok((Operation::FsChdir(target), None))
+}
+
 // (name, handler, arg index of the path)
 const FS_SYSCALLS_PATH: &[(&str, SyscallHandler1, u8)] = &[
 	(
@@ -201,13 +215,15 @@ const FS_SYSCALLS_PATH: &[(&str, SyscallHandler1, u8)] = &[
 		},
 		0,
 	),
-	("execve", |req, target| handle_exec_like(req, target), 0),
+	("execve", handle_exec_like, 0),
 	// The "source" of a symlink is arbitrary data, so we don't treat it as a FsTarget.
 	(
 		"symlink",
 		|req, target| handle_symlink_like(req, target, 0),
 		1,
 	),
+	("readlink", handle_readlink_like, 0),
+	("chdir", handle_chdir_like, 0),
 ];
 
 // (name, handler, arg index of the dfd, arg index of the path, arg index of AT_* flags or None if no such flag)
@@ -288,13 +304,8 @@ const FS_SYSCALLS_DFD_PATH: &[(&str, SyscallHandler1, u8, u8, Option<u8>)] = &[
 		1,
 		None,
 	),
-	(
-		"execveat",
-		|req, target| handle_exec_like(req, target),
-		0,
-		1,
-		Some(4),
-	),
+	("execveat", handle_exec_like, 0, 1, Some(4)),
+	("readlinkat", handle_readlink_like, 0, 1, None),
 ];
 // (name, handler, arg index of the first path, arg index of the second path)
 const FS_SYSCALLS_PATH_PATH: &[(&str, SyscallHandler2, u8, u8)] = &[
@@ -390,6 +401,9 @@ const FS_SYSCALLS_DFD_PATH_DFD_PATH: &[(&str, SyscallHandler2, u8, u8, u8, u8, O
 	),
 ];
 
+// (name, handler, fd)
+const FS_SYSCALLS_FD: &[(&str, SyscallHandler1, u8)] = &[("fchdir", handle_chdir_like, 0)];
+
 pub(crate) fn add_filter_rules(
 	filter_ctx: &mut ScmpFilterContext,
 ) -> Result<(), TurnstileTracerError> {
@@ -409,6 +423,11 @@ pub(crate) fn add_filter_rules(
 			.map_err(|e| TurnstileTracerError::AddRule(sys, e))?;
 	}
 	for &(sys, ..) in fs_syscall_dfd_path_dfd_path_table() {
+		filter_ctx
+			.add_rule(libseccomp::ScmpAction::Notify, sys)
+			.map_err(|e| TurnstileTracerError::AddRule(sys, e))?;
+	}
+	for &(sys, ..) in fs_syscalls_fd_table() {
 		filter_ctx
 			.add_rule(libseccomp::ScmpAction::Notify, sys)
 			.map_err(|e| TurnstileTracerError::AddRule(sys, e))?;
@@ -457,6 +476,7 @@ lazy_syscall_table_name_to_number!(
 	u8,
 	Option<u8>
 );
+lazy_syscall_table_name_to_number!(FS_SYSCALLS_FD, fs_syscalls_fd_table, SyscallHandler1, u8);
 
 pub(crate) fn handle_notification<'a>(
 	request_ctx: &mut RequestContext<'a>,
@@ -509,6 +529,14 @@ pub(crate) fn handle_notification<'a>(
 			let target2 =
 				FsTarget::from_at_path(request_ctx, dfd2_arg_index, path2_arg_index, None)?;
 			let (op, extra_op) = handler(request_ctx, target1, target2)?;
+			return Ok(Some(handler_return_to_access_req((op, extra_op))));
+		}
+	}
+
+	for &(sys, handler, fd_arg_index) in fs_syscalls_fd_table() {
+		if syscall == sys {
+			let target = FsTarget::from_fd(request_ctx, fd_arg_index)?;
+			let (op, extra_op) = handler(request_ctx, target)?;
 			return Ok(Some(handler_return_to_access_req((op, extra_op))));
 		}
 	}

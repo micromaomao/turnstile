@@ -19,6 +19,8 @@ pub enum Operation {
 	FsUnlink(fs::UnlinkOperation),
 	FsLink(fs::LinkOperation),
 	FsExec(fs::ExecOperation),
+	FsReadlink(fs::FsTarget),
+	FsChdir(fs::FsTarget),
 	UnixConnect(fs::FsTarget),
 	UnixListen(fs::FsTarget),
 	UnixSendto(fs::FsTarget),
@@ -101,6 +103,12 @@ impl std::fmt::Display for Operation {
 			}
 			Operation::FsExec(fs::ExecOperation { target, .. }) => {
 				write!(f, "exec {}", target)?;
+			}
+			Operation::FsReadlink(target) => {
+				write!(f, "readlink {}", target)?;
+			}
+			Operation::FsChdir(target) => {
+				write!(f, "chdir {}", target)?;
 			}
 			Operation::UnixConnect(target) => {
 				write!(f, "connect unix:{}", target)?;
