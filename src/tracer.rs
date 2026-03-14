@@ -75,16 +75,21 @@ impl TurnstileTracer {
 	/// request (or None if, for example, the syscall accesses an ignored
 	/// file).
 	///
-	/// If an [`AccessRequest`] is returned, the traced process is paused,
-	/// and the caller should respond to the request by calling either
-	/// [`AccessRequest::send_continue`] or [`AccessRequest::send_error`].
+	/// If an [`AccessRequest`](crate::AccessRequest) along with its
+	/// [`RequestContext`](crate::RequestContext) is returned, the traced
+	/// process is paused, and the caller should respond to the request by
+	/// calling either
+	/// [`RequestContext::send_continue`](crate::RequestContext::send_continue)
+	/// or
+	/// [`RequestContext::send_error`](crate::RequestContext::send_error).
 	/// If None is returned, the tracer is set to continue automatically.
 	/// The traced process is also resumed if the returned
-	/// [`AccessRequest`] is dropped.
+	/// [`RequestContext`](crate::RequestContext) is dropped.
 	///
-	/// If the caller leaks the returned [`AccessRequest`] without
-	/// responding to it, the traced process will be paused indefinitely
-	/// until it receives a signal.
+	/// If the caller leaks the returned
+	/// [`RequestContext`](crate::RequestContext) without responding to
+	/// it, the traced process will be paused indefinitely until it
+	/// receives a signal.
 	///
 	/// Blocks until the notify_fd is ready if it is not.
 	pub fn yield_request<'a>(
