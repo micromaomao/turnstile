@@ -453,6 +453,11 @@ pub struct StatOperation {
 }
 
 #[derive(Debug)]
+pub struct UnixBindOperation {
+	pub target: FsTarget,
+}
+
+#[derive(Debug)]
 pub enum FsOperation {
 	FsOpen(OpenOperation),
 	FsAccess(AccessOperation),
@@ -465,7 +470,7 @@ pub enum FsOperation {
 	FsChdir(FsTarget),
 	FsStat(StatOperation),
 	UnixConnect(FsTarget),
-	UnixListen(FsTarget),
+	UnixBind(UnixBindOperation),
 	UnixSendto(FsTarget),
 }
 
@@ -553,8 +558,8 @@ impl std::fmt::Display for FsOperation {
 			Self::UnixConnect(target) => {
 				write!(f, "connect unix:{}", target)?;
 			}
-			Self::UnixListen(target) => {
-				write!(f, "listen unix:{}", target)?;
+			Self::UnixBind(UnixBindOperation { target }) => {
+				write!(f, "bind unix:{}", target)?;
 			}
 			Self::UnixSendto(target) => {
 				write!(f, "sendto unix:{}", target)?;
