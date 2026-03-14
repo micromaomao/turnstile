@@ -13,7 +13,6 @@ const UNIX_SOCK_SYSCALLS: &[(&str, fn(FsTarget) -> FsOperation, u8, u8)] = &[
 	("connect", FsOperation::UnixConnect, 1, 2),
 	("bind", FsOperation::UnixListen, 1, 2),
 	("sendto", FsOperation::UnixSendto, 4, 5),
-	("recvfrom", FsOperation::UnixRecvfrom, 4, 5),
 ];
 
 lazy_syscall_table_name_to_number!(

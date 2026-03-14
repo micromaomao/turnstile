@@ -463,7 +463,6 @@ pub enum FsOperation {
 	UnixConnect(FsTarget),
 	UnixListen(FsTarget),
 	UnixSendto(FsTarget),
-	UnixRecvfrom(FsTarget),
 }
 
 fn write_rwx(
@@ -551,9 +550,6 @@ impl std::fmt::Display for FsOperation {
 			}
 			Self::UnixSendto(target) => {
 				write!(f, "sendto unix:{}", target)?;
-			}
-			Self::UnixRecvfrom(target) => {
-				write!(f, "recvfrom unix:{}", target)?;
 			}
 		}
 		Ok(())
