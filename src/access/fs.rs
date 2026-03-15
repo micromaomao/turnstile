@@ -484,6 +484,55 @@ pub enum FsOperation {
 	UnixSendto(FsTarget),
 }
 
+#[derive(Debug)]
+pub struct RwxPermission {
+	/// Target path.
+	///
+	/// For directory operations (create / delete / rename etc), this
+	/// points to the source or destination being operated on, which may
+	/// or may not exist yet.  In this case,
+	/// [`is_dir_op`](Self::is_dir_op) is true.
+	pub target: FsTarget,
+	/// The operation refers to a target within a directory, and the
+	/// permission is in fact required on the directory (i.e. parent of
+	/// [`target`](Self::target)).
+	pub is_dir_op: bool,
+	/// Need read access on either a file, device, symlink (for readlink),
+	/// directory, to connect to a Unix socket (for which write is also
+	/// required), or to create a link from this file.
+	pub read: bool,
+	/// Need write access for file or devices, ability to create or delete
+	/// the pointed to directory entry, connect to a Unix socket (for
+	/// which read is also required), or to link something else into the
+	/// pointed to entry.
+	pub write: bool,
+	/// Need execute access for files (not directories, as search
+	/// permission is always implied).
+	pub exec: bool,
+	/// Need the ability to stat the target path (but not necessarily read
+	/// it)
+	pub metadata_read: bool,
+}
+
+macro_rules! make_rwx {
+	($target:expr,$($field:ident),*) => {{
+		let mut perm = RwxPermission {
+			target: $target,
+			is_dir_op: false,
+			read: false,
+			write: false,
+			exec: false,
+			metadata_read: false,
+		};
+		// Get rid of unused mut warning
+		perm.read = false;
+		$(
+			perm.$field = true;
+		)*
+		perm
+	}};
+}
+
 fn write_rwx(
 	f: &mut std::fmt::Formatter<'_>,
 	need_read: bool,
@@ -500,7 +549,7 @@ fn write_rwx(
 		write!(f, "x")?;
 	}
 	if !need_read && !need_write && !need_exec {
-		write!(f, "path")?;
+		write!(f, "_")?;
 	}
 	Ok(())
 }
@@ -574,6 +623,101 @@ impl std::fmt::Display for FsOperation {
 			Self::UnixSendto(target) => {
 				write!(f, "sendto unix:{}", target)?;
 			}
+		}
+		Ok(())
+	}
+}
+
+impl FsOperation {
+	/// Simplify the operation into a list (up to two entries) of
+	/// effective r/w/x permissions needed.
+	pub fn as_rwx_permissions(&self) -> Vec<RwxPermission> {
+		match self {
+			Self::FsOpen(OpenOperation {
+				target,
+				need_read,
+				need_write,
+				create_mode,
+			}) => {
+				let mut p = make_rwx!(target.clone(),);
+				if *need_read {
+					p.read = true;
+				}
+				if *need_write || create_mode.is_some() {
+					p.write = true;
+				}
+				if create_mode.is_some() {
+					p.is_dir_op = true;
+				}
+				vec![p]
+			}
+			Self::FsAccess(AccessOperation {
+				target,
+				need_read,
+				need_write,
+				need_exec,
+			}) => {
+				let mut p = make_rwx!(target.clone(),);
+				if *need_read {
+					p.read = true;
+				}
+				if *need_write {
+					p.write = true;
+				}
+				if *need_exec {
+					p.exec = true;
+				}
+				vec![p]
+			}
+			Self::FsCreate(CreateOperation { target, .. }) => {
+				vec![make_rwx!(target.clone(), write, is_dir_op)]
+			}
+			Self::FsRename(RenameOperation { from, to, .. }) => {
+				vec![
+					make_rwx!(from.clone(), write, is_dir_op),
+					make_rwx!(to.clone(), write, is_dir_op),
+				]
+			}
+			Self::FsUnlink(UnlinkOperation { target, .. }) => {
+				vec![make_rwx!(target.clone(), write, is_dir_op)]
+			}
+			Self::FsLink(LinkOperation { from, to, .. }) => {
+				vec![
+					make_rwx!(from.clone(), read),
+					make_rwx!(to.clone(), write, is_dir_op),
+				]
+			}
+			Self::FsExec(ExecOperation { target, .. }) => {
+				vec![make_rwx!(target.clone(), exec)]
+			}
+			Self::FsReadlink(target) => {
+				vec![make_rwx!(target.clone(), read)]
+			}
+			Self::FsChdir(target) => {
+				vec![make_rwx!(target.clone(),)]
+			}
+			Self::FsStat(StatOperation { target, .. }) => {
+				vec![make_rwx!(target.clone(), metadata_read)]
+			}
+			Self::UnixConnect(target) => {
+				vec![make_rwx!(target.clone(), read, write)]
+			}
+			Self::UnixBind(UnixBindOperation { target }) => {
+				vec![make_rwx!(target.clone(), read, write)]
+			}
+			Self::UnixSendto(target) => {
+				vec![make_rwx!(target.clone(), read, write)]
+			}
+		}
+	}
+}
+
+impl std::fmt::Display for RwxPermission {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write_rwx(f, self.read, self.write, self.exec)?;
+		write!(f, " {}", self.target)?;
+		if self.is_dir_op {
+			write!(f, "/..")?;
 		}
 		Ok(())
 	}

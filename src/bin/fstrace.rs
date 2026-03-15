@@ -7,7 +7,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 
 use clap::Parser;
-use libturnstile::{AccessRequestError, TurnstileTracer};
+use libturnstile::{AccessRequestError, Operation, TurnstileTracer};
 
 /// Trace file operations of a program using libturnstile
 #[derive(Parser)]
@@ -21,6 +21,11 @@ struct Cli {
 	/// Add timestamps to each output line
 	#[arg(short = 't', long = "timestamps")]
 	timestamps: bool,
+
+	/// Print a simplified "rwx" representation of what accesses are
+	/// required
+	#[arg(long = "rwx")]
+	rwx: bool,
 
 	/// Program to trace and its arguments
 	#[arg(required = true)]
@@ -76,16 +81,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 							write!(output, "[{}.{:03}] ", now.as_secs(), now.subsec_millis())
 						{
 							error!("error writing to log: {}", e);
+							return;
 						}
 					}
 					let pid = ctx.sreq().pid;
 					let comm = std::fs::read(format!("/proc/{}/comm", pid))
 						.map(|r| String::from_utf8_lossy(&r).trim().to_string())
 						.unwrap_or_else(|_| String::from("???"));
-					if let Err(e) =
-						writeln!(output, "{}[{}] {}", comm, pid, access_request.operation())
-					{
+					if let Err(e) = match access_request.operation() {
+						Operation::FsOperation(fs_op) if cli.rwx => {
+							let rwxp = fs_op.as_rwx_permissions();
+							match &rwxp[..] {
+								[p] => writeln!(output, "{}[{}] {}", comm, pid, p),
+								[p1, p2] => {
+									writeln!(output, "{}[{}] {}; {}", comm, pid, p1, p2)
+								}
+								_ => panic!(
+									"unexpected number of permissions returned by as_rwx_permissions()"
+								),
+							}
+						}
+						Operation::FsOperation(fs_op) => {
+							writeln!(output, "{}[{}] {}", comm, pid, fs_op)
+						}
+						_ => Ok(()),
+					} {
 						error!("error writing to log: {}", e);
+						return;
 					}
 					if let Err(e) = ctx.send_continue() {
 						error!("error sending continue response: {}", e);
