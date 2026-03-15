@@ -5,13 +5,19 @@ use libseccomp::ScmpFilterContext;
 use crate::{
 	AccessRequest, AccessRequestError, Operation, TurnstileTracerError,
 	access::fs::{ForeignFd, FsOperation, FsTarget},
+	fs::UnixBindOperation,
 	syscalls::{RequestContext, lazy_syscall_table_name_to_number},
 };
 
 /// (name, handler, addr arg index, addrlen arg index).
 const UNIX_SOCK_SYSCALLS: &[(&str, fn(FsTarget) -> FsOperation, u8, u8)] = &[
 	("connect", FsOperation::UnixConnect, 1, 2),
-	("bind", FsOperation::UnixListen, 1, 2),
+	(
+		"bind",
+		|t| FsOperation::UnixBind(UnixBindOperation { target: t }),
+		1,
+		2,
+	),
 	("sendto", FsOperation::UnixSendto, 4, 5),
 ];
 
