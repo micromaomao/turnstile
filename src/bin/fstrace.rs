@@ -86,7 +86,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 					}
 					let pid = ctx.sreq().pid;
 					let comm = std::fs::read(format!("/proc/{}/comm", pid))
-						.map(|r| String::from_utf8_lossy(&r).trim().to_string())
+						.map(|r| r.trim_ascii().escape_ascii().to_string())
 						.unwrap_or_else(|_| String::from("???"));
 					if let Err(e) = match access_request.operation() {
 						Operation::FsOperation(fs_op) if cli.rwx => {
