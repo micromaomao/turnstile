@@ -38,6 +38,14 @@ fn dump_seccomp_request(req: &ScmpNotifReq) -> String {
 	)
 }
 
+/// Implements a seccomp-unotify-based access tracer.
+///
+/// <div class="warning">
+/// Seccomp-unotify is not a sandboxing solution on its own due to the
+/// limitations of syscall-based filtering (such as TOCTOU problems with
+/// memory references).  This struct does not provide any security when
+/// used alone.
+/// </div>
 #[derive(Debug)]
 pub struct TurnstileTracer {
 	/// Stores the seccomp filter context.
@@ -172,7 +180,7 @@ impl TurnstileTracer {
 	/// process.
 	pub fn install_filters(&self) -> Result<(), TurnstileTracerError> {
 		if self.notify_fd.get().is_some() {
-			panic!("Seccomp filters already loaded");
+			panic!("Seccomp filters already loaded elsewhere");
 		}
 
 		let filter_ctx = self.filter_ctx.lock().unwrap();
@@ -183,7 +191,7 @@ impl TurnstileTracer {
 		self.notify_fd.set(notify_fd).unwrap_or_else(|_| {
 			// This can only happen if we race with another thread
 			// also trying to load the filters
-			panic!("Seccomp filters already loaded")
+			panic!("Seccomp filters already loaded elsewhere");
 		});
 		Ok(())
 	}
@@ -194,12 +202,17 @@ impl TurnstileTracer {
 	/// [`Self::yield_request`] on another thread before calling this, as
 	/// this function will block until the execve() is done, which will
 	/// require the caller to allow the file access to continue.
+	///
+	/// Should the caller wish to do more complex setup in the pre_exec
+	/// stage, [`Command::pre_exec`](std::process::Command::pre_exec) can
+	/// be used to install more pre_exec hooks that will be called before
+	/// the seccomp filters are loaded.
 	pub fn run_command(
 		&self,
 		cmd: &mut std::process::Command,
 	) -> Result<std::process::Child, TurnstileTracerError> {
 		if self.notify_fd.get().is_some() {
-			panic!("Seccomp filters already loaded");
+			panic!("Seccomp filters already loaded elsewhere");
 		}
 
 		let mut notify_fd_sock = [-1, -1];
@@ -261,7 +274,7 @@ impl TurnstileTracer {
 				self.notify_fd.set(received_fd).unwrap_or_else(|_| {
 					// This can only happen if we race with another thread
 					// also trying to load the filters
-					panic!("Seccomp filters already loaded")
+					panic!("Seccomp filters already loaded elsewhere");
 				});
 				Ok(())
 			});
