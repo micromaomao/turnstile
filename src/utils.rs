@@ -2,10 +2,10 @@
 /// SCM_RIGHTS.  This function can safely be used in pre_exec context
 pub unsafe fn unix_send_fd(sock: libc::c_int, fd: libc::c_int) -> std::io::Result<()> {
 	// Use a [u64] buffer to ensure 8-byte alignment required by cmsghdr.
-	let cmsg_space =
+	const CMSG_SPACE: usize =
 		unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as libc::c_uint) as usize };
-	let num_u64s = (cmsg_space + 7) / 8;
-	let mut cmsg_buf: Vec<u64> = vec![0u64; num_u64s];
+	const NUM_U64S: usize = (CMSG_SPACE + 7) / 8;
+	let mut cmsg_buf = [0u64; NUM_U64S];
 
 	let mut dummy: u8 = 0;
 	let mut iov = libc::iovec {
@@ -17,7 +17,7 @@ pub unsafe fn unix_send_fd(sock: libc::c_int, fd: libc::c_int) -> std::io::Resul
 	msg.msg_iov = &mut iov;
 	msg.msg_iovlen = 1;
 	msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
-	msg.msg_controllen = cmsg_space as libc::size_t;
+	msg.msg_controllen = CMSG_SPACE as libc::size_t;
 
 	unsafe {
 		let cmsg = libc::CMSG_FIRSTHDR(&msg);
@@ -43,10 +43,10 @@ pub unsafe fn unix_send_fd(sock: libc::c_int, fd: libc::c_int) -> std::io::Resul
 
 /// Receive a file descriptor sent via SCM_RIGHTS over a Unix socket.
 pub fn unix_recv_fd(sock: libc::c_int) -> std::io::Result<libc::c_int> {
-	let cmsg_space =
+	const CMSG_SPACE: usize =
 		unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as libc::c_uint) as usize };
-	let num_u64s = (cmsg_space + 7) / 8;
-	let mut cmsg_buf: Vec<u64> = vec![0u64; num_u64s];
+	const NUM_U64S: usize = (CMSG_SPACE + 7) / 8;
+	let mut cmsg_buf = [0u64; NUM_U64S];
 
 	let mut dummy: u8 = 0;
 	let mut iov = libc::iovec {
@@ -58,7 +58,7 @@ pub fn unix_recv_fd(sock: libc::c_int) -> std::io::Result<libc::c_int> {
 	msg.msg_iov = &mut iov;
 	msg.msg_iovlen = 1;
 	msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
-	msg.msg_controllen = cmsg_space as libc::size_t;
+	msg.msg_controllen = CMSG_SPACE as libc::size_t;
 
 	let ret = unsafe { libc::recvmsg(sock, &mut msg, 0) };
 	if ret < 0 {
