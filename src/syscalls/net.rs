@@ -1,10 +1,10 @@
-use std::{ffi::CStr, mem::offset_of};
+use std::mem::offset_of;
 
 use libseccomp::ScmpFilterContext;
 
 use crate::{
 	AccessRequest, AccessRequestError, Operation, TurnstileTracerError,
-	access::fs::{ForeignFd, FsOperation, FsTarget},
+	access::fs::{FsOperation, FsTarget},
 	fs::UnixBindOperation,
 	syscalls::{RequestContext, lazy_syscall_table_name_to_number},
 };
@@ -81,23 +81,7 @@ fn read_sockaddr_un(
 		}
 	};
 
-	let target = if path.to_bytes().first() == Some(&b'/') {
-		FsTarget {
-			dfd: None,
-			path: path.to_owned(),
-			no_follow: false,
-		}
-	} else {
-		let cwdstr = format!("/proc/{}/cwd\0", req.sreq.pid);
-		FsTarget {
-			dfd: Some(
-				ForeignFd::from_path(CStr::from_bytes_with_nul(cwdstr.as_bytes()).unwrap())
-					.map_err(|e| AccessRequestError::OpenFd(cwdstr, e))?,
-			),
-			path: path.to_owned(),
-			no_follow: false,
-		}
-	};
+	let target = FsTarget::from_path_str(req, path)?;
 	Ok(Some(target))
 }
 

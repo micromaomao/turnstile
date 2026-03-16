@@ -1,11 +1,8 @@
 use std::{
 	borrow::Cow,
-	ffi::{CStr, CString, OsStr, OsString},
+	ffi::{CStr, CString, OsString},
 	io,
-	os::unix::{
-		ffi::{OsStrExt, OsStringExt},
-		io::AsRawFd,
-	},
+	os::unix::{ffi::OsStringExt, io::AsRawFd},
 };
 
 use crate::{AccessRequestError, syscalls::RequestContext};
@@ -107,17 +104,30 @@ impl Clone for ForeignFd {
 /// This struct preserves what was passed by the traced process, except
 /// that the base fd is opened by us from /proc, and so we have a local
 /// reference to the base location that will still be valid even if the
-/// traced process terminates.
+/// traced process terminates.  For absolute paths, we open the root of
+/// the process as the dfd, and remove the leading '/' from the path.
 #[derive(Debug, Clone)]
 pub struct FsTarget {
-	/// None iff path is absolute, in which case path must start with '/'.
-	pub(crate) dfd: Option<ForeignFd>,
+	/// The base fd of the target, which may be the root of the process
+	/// being traced if the path is absolute.
+	pub(crate) dfd: ForeignFd,
 
+	/// The path as originally passed by the traced process, except with
+	/// leading '/'s removed.
 	pub(crate) path: CString,
 
 	/// Whether to avoid following the final symlink component when resolving
 	/// this target (corresponds to AT_SYMLINK_NOFOLLOW).
 	pub(crate) no_follow: bool,
+}
+
+fn trim_leading_slashes(path: &CStr) -> &CStr {
+	let bytes = path.to_bytes_with_nul();
+	let mut start = 0;
+	while start < bytes.len() && bytes[start] == b'/' {
+		start += 1;
+	}
+	CStr::from_bytes_with_nul(&bytes[start..]).unwrap()
 }
 
 impl FsTarget {
@@ -132,21 +142,33 @@ impl FsTarget {
 		} else {
 			path = req.cstr_from_target_memory(path_ptr)?;
 		}
-		let pathb = path.as_bytes();
-		let absolute = pathb.len() > 0 && pathb[0] == b'/';
-		let mut ret = Self {
-			dfd: None,
-			path,
-			no_follow: false,
+		Self::from_path_str(req, path)
+	}
+
+	pub(crate) fn from_path_str<P: AsRef<CStr>>(
+		req: &mut RequestContext,
+		path: P,
+	) -> Result<Self, AccessRequestError> {
+		let absolute = {
+			let pathb = path.as_ref().to_bytes();
+			pathb.len() > 0 && pathb[0] == b'/'
 		};
-		if !absolute {
-			let cwdstr = format!("/proc/{}/cwd\0", req.sreq.pid);
-			ret.dfd = Some(
-				ForeignFd::from_path(CStr::from_bytes_with_nul(cwdstr.as_bytes()).unwrap())
-					.map_err(|e| AccessRequestError::OpenFd(cwdstr, e))?,
-			);
-		}
-		Ok(ret)
+		let path = if absolute {
+			trim_leading_slashes(path.as_ref())
+		} else {
+			path.as_ref()
+		};
+		let dfd_path = match absolute {
+			true => format!("/proc/{}/root\0", req.sreq.pid),
+			false => format!("/proc/{}/cwd\0", req.sreq.pid),
+		};
+		let dfd = ForeignFd::from_path(CStr::from_bytes_with_nul(dfd_path.as_bytes()).unwrap())
+			.map_err(|e| AccessRequestError::OpenFd(dfd_path, e))?;
+		Ok(Self {
+			dfd,
+			path: path.to_owned(),
+			no_follow: false,
+		})
 	}
 
 	pub(crate) fn from_at_path(
@@ -168,9 +190,11 @@ impl FsTarget {
 		let pathb = path.as_bytes();
 
 		if pathb.len() > 0 && pathb[0] == b'/' {
+			let root_path = format!("/proc/{}/root\0", req.sreq.pid);
 			return Ok(Self {
-				dfd: None,
-				path,
+				dfd: ForeignFd::from_path(CStr::from_bytes_with_nul(root_path.as_bytes()).unwrap())
+					.map_err(|e| AccessRequestError::OpenFd(root_path, e))?,
+				path: trim_leading_slashes(&path).to_owned(),
 				no_follow,
 			});
 		}
@@ -182,7 +206,7 @@ impl FsTarget {
 		}
 
 		Ok(Self {
-			dfd: Some(req.arg_to_fd(dfd_arg_index as usize)?),
+			dfd: req.arg_to_fd(dfd_arg_index as usize)?,
 			path,
 			no_follow,
 		})
@@ -194,7 +218,7 @@ impl FsTarget {
 	) -> Result<Self, AccessRequestError> {
 		let fd = req.arg_to_fd(fd_arg_index as usize)?;
 		Ok(Self {
-			dfd: Some(fd),
+			dfd: fd,
 			path: CString::from(c""),
 			no_follow: false,
 		})
@@ -203,22 +227,19 @@ impl FsTarget {
 	/// Opens the target with O_PATH.  This requires the path to actually
 	/// be pointing to an existing file or directory.
 	pub fn open_target(&self) -> Result<ForeignFd, io::Error> {
-		if self.path.is_empty() {
-			let dfd = self
-				.dfd
-				.as_ref()
-				.expect("Expected dfd to exist for non-absolute path");
-			return Ok(dfd.clone());
+		if self.path.is_empty() || self.path.as_bytes() == b"." || self.path.as_bytes() == b"./" {
+			return Ok(self.dfd.clone());
 		}
 
 		let mut flags = libc::O_PATH | libc::O_CLOEXEC;
 		if self.no_follow {
 			flags |= libc::O_NOFOLLOW;
 		}
-		let fd = match &self.dfd {
-			None => unsafe { libc::open(self.path.as_ptr(), flags, 0) },
-			Some(dfd) => unsafe { libc::openat(dfd.as_raw_fd(), self.path.as_ptr(), flags, 0) },
-		};
+
+		// We should have gotten rid of any absolute paths.
+		debug_assert!(self.path.as_bytes().first().copied() != Some(b'/'));
+
+		let fd = unsafe { libc::openat(self.dfd.as_raw_fd(), self.path.as_ptr(), flags, 0) };
 		if fd < 0 {
 			return Err(io::Error::last_os_error());
 		}
@@ -268,46 +289,30 @@ impl FsTarget {
 			dir_path = Cow::Owned(CString::new(&p_with_nul[..last_slash + 1]).unwrap());
 			filename = CStr::from_bytes_with_nul(&p_with_nul[last_slash + 1..]).unwrap();
 		} else {
-			if self.dfd.is_none() {
-				dir_path = Cow::Borrowed(CStr::from_bytes_with_nul(b"/\0").unwrap());
-			} else {
-				dir_path = Cow::Borrowed(CStr::from_bytes_with_nul(b"./\0").unwrap());
-				can_skip_open = true;
-			}
+			dir_path = Cow::Borrowed(CStr::from_bytes_with_nul(b"./\0").unwrap());
 			filename = CStr::from_bytes_with_nul(p_with_nul).unwrap();
+			can_skip_open = true;
 		}
 
-		// None or Some-ness of self.dfd should agree with whether the
-		// path is absolute.
-		assert_eq!(
-			dir_path.to_bytes().first().copied() == Some(b'/'),
-			self.dfd.is_none()
-		);
-
 		if can_skip_open {
-			opened_dfd = self.dfd.clone().unwrap();
+			opened_dfd = self.dfd.clone();
 		} else {
-			let dfd_raw = match &self.dfd {
-				Some(dfd) => unsafe {
-					libc::openat(
-						dfd.as_raw_fd(),
-						dir_path.as_ptr(),
-						libc::O_PATH | libc::O_CLOEXEC | libc::O_DIRECTORY,
-						0,
-					)
-				},
-				None => unsafe {
-					libc::open(
-						dir_path.as_ptr(),
-						libc::O_PATH | libc::O_CLOEXEC | libc::O_DIRECTORY,
-						0,
-					)
-				},
+			// We should have gotten rid of any absolute paths
+			debug_assert!(dir_path.to_bytes().first().copied() != Some(b'/'));
+			let parent_fd = unsafe {
+				libc::openat(
+					self.dfd.as_raw_fd(),
+					dir_path.as_ptr(),
+					libc::O_PATH | libc::O_CLOEXEC | libc::O_DIRECTORY,
+					0,
+				)
 			};
-			if dfd_raw < 0 {
+			if parent_fd < 0 {
 				return Err(io::Error::last_os_error());
 			}
-			opened_dfd = ForeignFd { local_fd: dfd_raw };
+			opened_dfd = ForeignFd {
+				local_fd: parent_fd,
+			};
 		}
 
 		Ok((opened_dfd, filename))
@@ -321,11 +326,7 @@ impl FsTarget {
 
 		// AT_EMPTY_PATH: the target is the dfd itself — read its proc symlink.
 		if path_bytes.is_empty() {
-			let dfd = self
-				.dfd
-				.as_ref()
-				.expect("Expected dfd to exist for non-absolute path");
-			return dfd.readlink();
+			return self.dfd.readlink();
 		}
 
 		let (dir_fd, file_name) = self.open_target_dir()?;
@@ -342,8 +343,8 @@ impl FsTarget {
 		Ok(OsString::from_vec(result))
 	}
 
-	pub fn dfd(&self) -> Option<&ForeignFd> {
-		self.dfd.as_ref()
+	pub fn dfd(&self) -> &ForeignFd {
+		&self.dfd
 	}
 
 	pub fn path(&self) -> &CStr {
@@ -360,26 +361,19 @@ impl std::fmt::Display for FsTarget {
 			}
 			Err(rp_err) => {
 				debug!("realpath() on FsTarget failed: {}", rp_err);
-				match &self.dfd {
-					Some(dfd) => {
-						let mut dfd_path_bytes = dfd
-							.readlink()
-							.unwrap_or_else(|e| {
-								debug!("unable to readlink() on FsTarget's dfd: {}", e);
-								OsString::from("???")
-							})
-							.into_encoded_bytes();
-						if dfd_path_bytes.last().copied() != Some(b'/') {
-							dfd_path_bytes.push(b'/');
-						}
-						dfd_path_bytes.extend_from_slice(self.path.to_bytes());
-						write!(f, "{:?} (invalid)", OsString::from_vec(dfd_path_bytes))
-					}
-					None => {
-						// self.path is absolute, so already have leading '/'
-						write!(f, "{:?} (invalid)", OsStr::from_bytes(self.path.as_bytes()))
-					}
+				let mut dfd_path_bytes = self
+					.dfd
+					.readlink()
+					.unwrap_or_else(|e| {
+						debug!("unable to readlink() on FsTarget's dfd: {}", e);
+						OsString::from("???")
+					})
+					.into_encoded_bytes();
+				if dfd_path_bytes.last().copied() != Some(b'/') {
+					dfd_path_bytes.push(b'/');
 				}
+				dfd_path_bytes.extend_from_slice(self.path.to_bytes());
+				write!(f, "{:?} (invalid)", OsString::from_vec(dfd_path_bytes))
 			}
 		}
 	}
