@@ -323,7 +323,7 @@ impl ManagedNamespaces {
 #[derive(Debug)]
 pub struct MountObj(ForeignFd);
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct MountAttributes {
 	pub readonly: bool,
 	pub noexec: bool,
@@ -437,28 +437,26 @@ impl MountObj {
 	pub fn new_bind(
 		source_dfd: libc::c_int,
 		source_path: &CStr,
-		attrs: &MountAttributes,
+		attrs: MountAttributes,
+		follow_source_symlinks: bool,
 	) -> io::Result<Self> {
+		let mut flags =
+			libc::OPEN_TREE_CLONE | libc::OPEN_TREE_CLOEXEC | libc::AT_RECURSIVE as libc::c_uint;
+		if source_path.is_empty() {
+			flags |= libc::AT_EMPTY_PATH as libc::c_uint;
+		}
+		if !follow_source_symlinks {
+			flags |= libc::AT_SYMLINK_NOFOLLOW as libc::c_uint;
+		}
 		unsafe {
-			let mnt = libc::syscall(
-				libc::SYS_open_tree,
-				source_dfd,
-				source_path.as_ptr(),
-				if source_path.is_empty() {
-					libc::AT_EMPTY_PATH as libc::c_uint
-				} else {
-					0 as libc::c_uint
-				} | libc::OPEN_TREE_CLONE
-					| libc::OPEN_TREE_CLOEXEC
-					| libc::AT_SYMLINK_NOFOLLOW as libc::c_uint
-					| libc::AT_RECURSIVE as libc::c_uint,
-			) as libc::c_int;
+			let mnt = libc::syscall(libc::SYS_open_tree, source_dfd, source_path.as_ptr(), flags)
+				as libc::c_int;
 			if mnt < 0 {
 				let err = perror!("open_tree");
 				return Err(io::Error::from_raw_os_error(err));
 			}
 			let mnt = Self(ForeignFd { local_fd: mnt });
-			mnt.setattr(attrs, &MountAttributes::default())?;
+			mnt.setattr(attrs, MountAttributes::default())?;
 			Ok(mnt)
 		}
 	}
@@ -469,8 +467,8 @@ impl MountObj {
 	/// rights to clear).
 	pub fn setattr(
 		&self,
-		attrs: &MountAttributes,
-		existing_attr: &MountAttributes,
+		attrs: MountAttributes,
+		existing_attr: MountAttributes,
 	) -> io::Result<()> {
 		unsafe {
 			let mut mount_attr = std::mem::zeroed::<libc::mount_attr>();
@@ -499,6 +497,36 @@ impl MountObj {
 			Ok(())
 		}
 	}
+
+	pub fn mount(
+		&self,
+		dest_dfd: libc::c_int,
+		dest_path: &CStr,
+		follow_dest_symlink: bool,
+	) -> io::Result<()> {
+		let mut flags = libc::MOVE_MOUNT_F_EMPTY_PATH;
+		if follow_dest_symlink {
+			flags |= libc::MOVE_MOUNT_T_SYMLINKS;
+		}
+		if dest_path.is_empty() {
+			flags |= libc::MOVE_MOUNT_T_EMPTY_PATH;
+		}
+		unsafe {
+			let res = libc::syscall(
+				libc::SYS_move_mount,
+				self.0.as_raw_fd(),
+				c"".as_ptr(),
+				dest_dfd,
+				dest_path.as_ptr(),
+				flags,
+			);
+			if res != 0 {
+				let err = perror!("move_mount");
+				return Err(io::Error::from_raw_os_error(err));
+			}
+		}
+		Ok(())
+	}
 }
 
 #[derive(Debug)]
@@ -506,6 +534,45 @@ pub struct BindMountSandbox {
 	tracer: TurnstileTracer,
 	namespaces: ManagedNamespaces,
 	root_tmpfs: MountObj,
+}
+
+#[derive(Debug)]
+pub struct MountBuilder<'a, 'b> {
+	host_path: &'a CStr,
+	sandbox_path: &'a CStr,
+	attrs: MountAttributes,
+	follow_host_symlinks: bool,
+	follow_sandbox_symlinks: bool,
+	sandbox: &'b BindMountSandbox,
+}
+
+impl<'a, 'b> MountBuilder<'a, 'b> {
+	pub fn attributes(&mut self, attrs: MountAttributes) -> &mut Self {
+		self.attrs = attrs;
+		self
+	}
+
+	/// If host path points into a location controllable or writable by
+	/// the sandboxed process, this must not be used.
+	pub fn follow_host_symlinks(&mut self, follow: bool) -> &mut Self {
+		self.follow_host_symlinks = follow;
+		self
+	}
+
+	pub fn follow_sandbox_symlinks(&mut self, follow: bool) -> &mut Self {
+		self.follow_sandbox_symlinks = follow;
+		self
+	}
+
+	pub fn mount(self) -> Result<(), BindMountSandboxError> {
+		self.sandbox._mount_host_into_sandbox(
+			self.host_path,
+			self.sandbox_path,
+			self.attrs,
+			self.follow_host_symlinks,
+			self.follow_sandbox_symlinks,
+		)
+	}
 }
 
 impl BindMountSandbox {
@@ -584,15 +651,15 @@ impl BindMountSandbox {
 			namespaces,
 			root_tmpfs,
 		};
-		s.mount_host_into_ns(
+		s._mount_host_into_sandbox(
 			CStr::from_bytes_with_nul(
-				// use /. to cancel the effect of AT_SYMLINK_NOFOLLOW - in
-				// this case we do want to step into the (magic) symlink
-				format!("/proc/self/fd/{}/.\0", s.root_tmpfs.0.as_raw_fd()).as_bytes(),
+				format!("/proc/self/fd/{}\0", s.root_tmpfs.0.as_raw_fd()).as_bytes(),
 			)
 			.unwrap(),
 			c"/",
-			&MountAttributes::ro(),
+			MountAttributes::ro(),
+			true,
+			false,
 		)?;
 		Ok(s)
 	}
@@ -686,20 +753,43 @@ impl BindMountSandbox {
 		Ok(fd)
 	}
 
-	pub fn mount_host_into_ns(
+	/// If host_path points into a place controllable by the sandboxed
+	/// process, follow_host_symlinks must be false.
+	pub(self) fn _mount_host_into_sandbox(
 		&self,
 		host_path: &CStr,
 		ns_path: &CStr,
-		attrs: &MountAttributes,
+		attrs: MountAttributes,
+		follow_host_symlinks: bool,
+		follow_ns_symlinks: bool,
 	) -> Result<(), BindMountSandboxError> {
 		if !ns_path.to_bytes().starts_with(b"/") {
 			panic!("ns_path must be an absolute path");
 		}
-		let host_fd = ForeignFd::from_path_with_flags(
-			host_path,
-			libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-		)
-		.map_err(|e| BindMountSandboxError::ResolveHostPath(host_path.to_owned(), e))?;
+		let mut open_how: libc::open_how = unsafe { std::mem::zeroed() };
+		open_how.flags = (libc::O_PATH | libc::O_CLOEXEC) as u64;
+		if !follow_host_symlinks {
+			open_how.flags |= libc::O_NOFOLLOW as u64;
+			open_how.resolve |= libc::RESOLVE_NO_SYMLINKS;
+		}
+		let host_fd = unsafe {
+			libc::syscall(
+				libc::SYS_openat2,
+				libc::AT_FDCWD,
+				host_path.as_ptr(),
+				&open_how,
+				std::mem::size_of_val(&open_how),
+			) as libc::c_int
+		};
+		if host_fd < 0 {
+			let err = io::Error::last_os_error();
+			return Err(BindMountSandboxError::ResolveHostPath(
+				host_path.to_owned(),
+				err,
+			));
+		}
+		let host_fd = ForeignFd { local_fd: host_fd };
+
 		let mut stat: libc::stat;
 		unsafe {
 			stat = std::mem::zeroed();
@@ -727,14 +817,38 @@ impl BindMountSandbox {
 						return e.raw_os_error().unwrap_or(libc::EIO);
 					}
 				}
-				// We can't use host_fd here because we need to re-open
-				// the host path within the namespace
-				let source_tree = match MountObj::new_bind(libc::AT_FDCWD, host_path, attrs) {
-					Ok(tree) => tree,
-					Err(e) => {
-						return e.raw_os_error().unwrap_or(libc::EIO);
+				// We can't use host_fd here because it belongs to the
+				// host namespace, and will be rejected by open_tree().
+				// Let's open again.
+				// TODO: ideally BindMountSandbox will save a fd to the
+				// m9's root so we can just do this outside.
+				let host_fd = libc::syscall(
+					libc::SYS_openat2,
+					libc::AT_FDCWD,
+					host_path.as_ptr(),
+					&open_how,
+					std::mem::size_of_val(&open_how),
+				) as libc::c_int;
+				if host_fd < 0 {
+					let err = libc::__errno_location().read();
+					if ENABLE_LOG_IN_FORK {
+						error!(
+							"Failed to open host path {:?} in mount helper process: errno {}",
+							host_path, err
+						);
 					}
-				};
+					return err;
+				}
+				let host_fd = ForeignFd { local_fd: host_fd };
+				let source_tree =
+					match MountObj::new_bind(host_fd.as_raw_fd(), c"", attrs, follow_host_symlinks)
+					{
+						Ok(tree) => tree,
+						Err(e) => {
+							return e.raw_os_error().unwrap_or(libc::EIO);
+						}
+					};
+				drop(host_fd);
 				match nsenter_fn_m1() {
 					Ok(()) => (),
 					Err(e) => {
@@ -748,16 +862,11 @@ impl BindMountSandbox {
 				if res != 0 {
 					return perror!("chdir");
 				}
-				let res = libc::syscall(
-					libc::SYS_move_mount,
-					source_tree.0.as_raw_fd(),
-					c"".as_ptr(),
-					libc::AT_FDCWD,
-					ns_path.as_ptr(),
-					libc::MOVE_MOUNT_F_EMPTY_PATH,
-				);
-				if res != 0 {
-					return perror!("move_mount");
+				match source_tree.mount(libc::AT_FDCWD, ns_path, follow_ns_symlinks) {
+					Ok(()) => (),
+					Err(e) => {
+						return e.raw_os_error().unwrap_or(libc::EIO);
+					}
 				}
 				0
 			})
@@ -774,11 +883,26 @@ impl BindMountSandbox {
 		Ok(())
 	}
 
+	pub fn mount_host_into_sandbox<'a, 'b>(
+		&'b self,
+		host_path: &'a CStr,
+		sandbox_path: &'a CStr,
+	) -> MountBuilder<'a, 'b> {
+		MountBuilder {
+			host_path,
+			sandbox_path,
+			attrs: MountAttributes::default(),
+			follow_host_symlinks: false,
+			follow_sandbox_symlinks: false,
+			sandbox: self,
+		}
+	}
+
 	pub fn set_mount_attr_within_ns(
 		&self,
 		ns_path: &CStr,
-		attrs: &MountAttributes,
-		existing_attrs: &MountAttributes,
+		attrs: MountAttributes,
+		existing_attrs: MountAttributes,
 	) -> Result<(), BindMountSandboxError> {
 		if !ns_path.to_bytes().starts_with(b"/") {
 			panic!("ns_path must be an absolute path");

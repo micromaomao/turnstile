@@ -47,27 +47,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	});
 
 	let sandbox = &context.sandbox;
-	sandbox.mount_host_into_ns(c"/usr", c"/usr", &MountAttributes::rx())?;
-	sandbox.mount_host_into_ns(c"/bin", c"/bin", &MountAttributes::rx())?;
-	sandbox.mount_host_into_ns(c"/lib", c"/lib", &MountAttributes::rx())?;
+	let mount = |host_path: &CStr,
+	             sandbox_path: &CStr,
+	             attrs: MountAttributes|
+	 -> Result<(), libturnstile::BindMountSandboxError> {
+		let mut mount = sandbox.mount_host_into_sandbox(host_path, sandbox_path);
+		mount.attributes(attrs);
+		mount.mount()
+	};
+
+	mount(c"/usr", c"/usr", MountAttributes::rx())?;
+	mount(c"/bin", c"/bin", MountAttributes::rx())?;
+	mount(c"/lib", c"/lib", MountAttributes::rx())?;
 	if std::fs::exists("/lib64").unwrap_or(false) {
-		sandbox.mount_host_into_ns(c"/lib64", c"/lib64", &MountAttributes::rx())?;
+		mount(c"/lib64", c"/lib64", MountAttributes::rx())?;
 	}
-	sandbox.mount_host_into_ns(c"/etc", c"/etc", &MountAttributes::rx())?;
-	sandbox.mount_host_into_ns(c"/dev", c"/dev", &MountAttributes::rwx())?;
-	sandbox.mount_host_into_ns(c"/proc", c"/proc", &MountAttributes::rwx())?;
+	mount(c"/etc", c"/etc", MountAttributes::rx())?;
+	mount(c"/dev", c"/dev", MountAttributes::rwx())?;
+	mount(c"/proc", c"/proc", MountAttributes::rwx())?;
 	let pwd = std::env::current_dir()?
 		.into_os_string()
 		.into_encoded_bytes();
 	let pwd = CString::new(pwd).unwrap();
-	sandbox.mount_host_into_ns(&pwd, &pwd, &MountAttributes::ro())?;
+	mount(&pwd, &pwd, MountAttributes::ro())?;
 	let sandbox_tmp = env::temp_dir().join("sandbox-tmp");
 	std::fs::create_dir_all(&sandbox_tmp)?;
-	sandbox.mount_host_into_ns(
-		&CString::new(sandbox_tmp.into_os_string().into_encoded_bytes()).unwrap(),
-		c"/tmp",
-		&MountAttributes::rwx(),
-	)?;
+	let sandbox_tmp = CString::new(sandbox_tmp.into_os_string().into_encoded_bytes()).unwrap();
+	mount(&sandbox_tmp, c"/tmp", MountAttributes::rwx())?;
 
 	let program = &cli.command[0];
 	let args = &cli.command[1..];
@@ -84,8 +90,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 		eprintln!("Now allowing write access on {:?}", pwd);
 		if let Err(e) = context.sandbox.set_mount_attr_within_ns(
 			&pwd,
-			&MountAttributes::rw(),
-			&MountAttributes::ro(),
+			MountAttributes::rw(),
+			MountAttributes::ro(),
 		) {
 			error!("Failed to set mount attributes: {e}");
 		}
@@ -96,8 +102,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 		eprintln!("Now taking away write access on {:?}", pwd);
 		if let Err(e) = context.sandbox.set_mount_attr_within_ns(
 			&pwd,
-			&MountAttributes::ro(),
-			&MountAttributes::rw(),
+			MountAttributes::ro(),
+			MountAttributes::rw(),
 		) {
 			error!("Failed to set mount attributes: {e}");
 		}
