@@ -15,6 +15,7 @@ mod access;
 mod errors;
 mod syscalls;
 mod tracer;
+mod utils;
 
 pub use crate::access::*;
 pub use crate::errors::*;
