@@ -13,6 +13,7 @@ use crate::{
 	AccessRequest, AccessRequestError, TurnstileTracerError,
 	fs::ForeignFd,
 	syscalls::{self, RequestContext},
+	utils::{unix_recv_fd, unix_send_fd},
 };
 
 use log::{error, warn};
@@ -37,6 +38,14 @@ fn dump_seccomp_request(req: &ScmpNotifReq) -> String {
 	)
 }
 
+/// Implements a seccomp-unotify-based access tracer.
+///
+/// <div class="warning">
+/// Seccomp-unotify is not a sandboxing solution on its own due to the
+/// limitations of syscall-based filtering (such as TOCTOU problems with
+/// memory references).  This struct does not provide any security when
+/// used alone.
+/// </div>
 #[derive(Debug)]
 pub struct TurnstileTracer {
 	/// Stores the seccomp filter context.
@@ -171,7 +180,7 @@ impl TurnstileTracer {
 	/// process.
 	pub fn install_filters(&self) -> Result<(), TurnstileTracerError> {
 		if self.notify_fd.get().is_some() {
-			panic!("Seccomp filters already loaded");
+			panic!("Seccomp filters already loaded elsewhere");
 		}
 
 		let filter_ctx = self.filter_ctx.lock().unwrap();
@@ -182,7 +191,7 @@ impl TurnstileTracer {
 		self.notify_fd.set(notify_fd).unwrap_or_else(|_| {
 			// This can only happen if we race with another thread
 			// also trying to load the filters
-			panic!("Seccomp filters already loaded")
+			panic!("Seccomp filters already loaded elsewhere");
 		});
 		Ok(())
 	}
@@ -193,12 +202,17 @@ impl TurnstileTracer {
 	/// [`Self::yield_request`] on another thread before calling this, as
 	/// this function will block until the execve() is done, which will
 	/// require the caller to allow the file access to continue.
+	///
+	/// Should the caller wish to do more complex setup in the pre_exec
+	/// stage, [`Command::pre_exec`](std::process::Command::pre_exec) can
+	/// be used to install more pre_exec hooks that will be called before
+	/// the seccomp filters are loaded.
 	pub fn run_command(
 		&self,
 		cmd: &mut std::process::Command,
 	) -> Result<std::process::Child, TurnstileTracerError> {
 		if self.notify_fd.get().is_some() {
-			panic!("Seccomp filters already loaded");
+			panic!("Seccomp filters already loaded elsewhere");
 		}
 
 		let mut notify_fd_sock = [-1, -1];
@@ -260,7 +274,7 @@ impl TurnstileTracer {
 				self.notify_fd.set(received_fd).unwrap_or_else(|_| {
 					// This can only happen if we race with another thread
 					// also trying to load the filters
-					panic!("Seccomp filters already loaded")
+					panic!("Seccomp filters already loaded elsewhere");
 				});
 				Ok(())
 			});
@@ -292,90 +306,4 @@ impl SendableContextPtr {
 	fn into_ptr(self) -> scmp_filter_ctx {
 		self.0
 	}
-}
-
-/// Send a file descriptor to another process via a Unix socket using
-/// SCM_RIGHTS.  This function must be async-signal-safe as it will be
-/// called in pre_exec context
-unsafe fn unix_send_fd(sock: libc::c_int, fd: libc::c_int) -> std::io::Result<()> {
-	// Use a [u64] buffer to ensure 8-byte alignment required by cmsghdr.
-	let cmsg_space =
-		unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as libc::c_uint) as usize };
-	let num_u64s = (cmsg_space + 7) / 8;
-	let mut cmsg_buf: Vec<u64> = vec![0u64; num_u64s];
-
-	let mut dummy: u8 = 0;
-	let mut iov = libc::iovec {
-		iov_base: &mut dummy as *mut u8 as *mut libc::c_void,
-		iov_len: 1,
-	};
-
-	let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-	msg.msg_iov = &mut iov;
-	msg.msg_iovlen = 1;
-	msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
-	msg.msg_controllen = cmsg_space as libc::size_t;
-
-	unsafe {
-		let cmsg = libc::CMSG_FIRSTHDR(&msg);
-		if cmsg.is_null() {
-			// io::Error::new() allocates and is not safe in a pre_exec context;
-			// this branch is unreachable since we sized the buffer correctly above.
-			panic!("CMSG_FIRSTHDR returned null");
-		}
-		(*cmsg).cmsg_level = libc::SOL_SOCKET;
-		(*cmsg).cmsg_type = libc::SCM_RIGHTS;
-		(*cmsg).cmsg_len =
-			libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as libc::c_uint) as libc::size_t;
-		let fd_data = libc::CMSG_DATA(cmsg) as *mut libc::c_int;
-		std::ptr::write_unaligned(fd_data, fd);
-	}
-
-	let ret = unsafe { libc::sendmsg(sock, &msg, libc::MSG_NOSIGNAL) };
-	if ret < 0 {
-		return Err(std::io::Error::last_os_error());
-	}
-	Ok(())
-}
-
-/// Receive a file descriptor sent via SCM_RIGHTS over a Unix socket.
-fn unix_recv_fd(sock: libc::c_int) -> std::io::Result<libc::c_int> {
-	let cmsg_space =
-		unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as libc::c_uint) as usize };
-	let num_u64s = (cmsg_space + 7) / 8;
-	let mut cmsg_buf: Vec<u64> = vec![0u64; num_u64s];
-
-	let mut dummy: u8 = 0;
-	let mut iov = libc::iovec {
-		iov_base: &mut dummy as *mut u8 as *mut libc::c_void,
-		iov_len: 1,
-	};
-
-	let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-	msg.msg_iov = &mut iov;
-	msg.msg_iovlen = 1;
-	msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
-	msg.msg_controllen = cmsg_space as libc::size_t;
-
-	let ret = unsafe { libc::recvmsg(sock, &mut msg, 0) };
-	if ret < 0 {
-		return Err(std::io::Error::last_os_error());
-	}
-	if ret == 0 {
-		return Err(std::io::Error::new(
-			std::io::ErrorKind::UnexpectedEof,
-			"child closed socket without sending notify fd",
-		));
-	}
-
-	let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
-	if cmsg.is_null() {
-		return Err(std::io::Error::new(
-			std::io::ErrorKind::InvalidData,
-			"no control message received",
-		));
-	}
-	let received_fd =
-		unsafe { std::ptr::read_unaligned(libc::CMSG_DATA(cmsg) as *const libc::c_int) };
-	Ok(received_fd)
 }
