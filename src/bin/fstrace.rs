@@ -9,6 +9,10 @@ use std::time::SystemTime;
 use clap::Parser;
 use libturnstile::{AccessRequestError, Operation, TurnstileTracer};
 
+use crate::common::{ProcPidFd, handle_child_result};
+
+mod common;
+
 /// Trace file operations of a program using libturnstile
 #[derive(Parser)]
 #[command(name = "fstrace")]
@@ -35,17 +39,11 @@ struct Cli {
 #[derive(Debug)]
 pub struct Context {
 	tracer: TurnstileTracer,
-	pidfd: OnceLock<libc::c_int>,
+	pidfd: OnceLock<ProcPidFd>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-	let mut log_builder = env_logger::builder();
-	if env::var_os("RUST_LOG").is_none() {
-		log_builder.filter_level(log::LevelFilter::Info);
-	} else {
-		log_builder.parse_default_env();
-	}
-	log_builder.init();
+	common::init_logger();
 
 	let cli = Cli::parse();
 
@@ -115,26 +113,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 				}
 				Ok(None) => {}
 				Err(e) => {
-					if let Some(&pidfd) = context.pidfd.get() {
-						let status_fd = unsafe {
-							libc::openat(
-								pidfd,
-								c"status".as_ptr(),
-								libc::O_RDONLY | libc::O_CLOEXEC,
-							)
-						};
-						if status_fd < 0 {
-							break;
-						}
-						let mut status_file = unsafe { std::fs::File::from_raw_fd(status_fd) };
-						let mut status_contents = String::new();
-						if let Err(_) =
-							std::io::Read::read_to_string(&mut status_file, &mut status_contents)
-						{
-							break;
-						}
-						if status_contents.contains("State:\tZ") {
-							break;
+					if let Some(pidfd) = context.pidfd.get() {
+						match pidfd.is_alive() {
+							Ok(alive) => {
+								if !alive {
+									break;
+								}
+							}
+							Err(e) => {
+								error!("error checking if child process is alive: {}", e);
+							}
 						}
 					}
 					if let AccessRequestError::InvalidSyscallData(_) = e {
@@ -147,31 +135,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	});
 
 	let child_result = context.tracer.run_command(&mut cmd);
-	match child_result {
-		Ok(mut child) => {
-			let pidfd = unsafe {
-				libc::open(
-					format!("/proc/{}\0", child.id()).as_ptr() as *const libc::c_char,
-					libc::O_RDONLY | libc::O_CLOEXEC,
-				)
-			};
-			if pidfd < 0 {
-				error!("error opening pidfd: {}", std::io::Error::last_os_error());
-				_ = child.kill();
-				std::process::exit(1);
-			}
-			context.pidfd.set(pidfd).unwrap();
-			let status = child.wait()?;
-			if status.success() {
-				info!("child process exited with status {}", status);
-			} else {
-				error!("child process exited with status {}", status);
-			}
-			std::process::exit(status.code().unwrap_or(1));
-		}
-		Err(e) => {
-			error!("error spawning child: {}", e);
-			std::process::exit(1);
-		}
-	}
+	handle_child_result(child_result, &context.pidfd)
 }
