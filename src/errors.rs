@@ -91,6 +91,8 @@ pub enum BindMountSandboxError {
 	Mkdir(#[source] std::io::Error),
 	#[error("Failed to create file for mountpoint within sandbox: {0}")]
 	Mkfile(#[source] std::io::Error),
+	#[error("Failed to create symlink within sandbox: {0}")]
+	Symlinkat(#[source] std::io::Error),
 	#[error("Failed to set attribute on mountpoint within sandbox: {0}")]
 	MountSetAttrsFailed(libc::c_int),
 	#[error("Failed to stat path on host: {0:?}: {1}")]

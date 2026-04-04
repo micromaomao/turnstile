@@ -687,11 +687,24 @@ impl BindMountSandbox {
 		Ok(s)
 	}
 
-	pub fn create_hierarchy_within_ns(
+	/// Create either a file or directory at the given absolute path
+	/// within the sandbox's backing tmpfs.  This makes a new empty file
+	/// or directory appear within the sandbox, unless the path or any of
+	/// its parent directories is already bind-mounted to some other host
+	/// path, in which case the new file or directory will not be visible.
+	///
+	/// If any of the path's parent doesn't exist or is not a directory, a
+	/// directory is created in its place (overriding any existing files,
+	/// which is sensible since this is a placeholder fs)
+	pub fn create_hierarchy(
 		&self,
 		path: &CStr,
 		leaf_is_dir: bool,
 	) -> Result<ForeignFd, BindMountSandboxError> {
+		if !path.to_bytes().starts_with(b"/") {
+			panic!("path must be absolute");
+		}
+
 		let mut fd = self.root_tmpfs.0.clone();
 		let components = path
 			.to_bytes()
@@ -754,8 +767,12 @@ impl BindMountSandbox {
 							return Err(BindMountSandboxError::StatSandboxPath(err));
 						}
 						let is_dir = stat.st_mode & libc::S_IFMT == libc::S_IFDIR;
+						let is_regular_file = stat.st_mode & libc::S_IFMT == libc::S_IFREG;
 						let expect_is_dir = !is_leaf || leaf_is_dir;
-						if is_dir == expect_is_dir {
+						if expect_is_dir && is_dir {
+							break newfd;
+						}
+						if !expect_is_dir && is_regular_file {
 							break newfd;
 						}
 						let ret = libc::unlinkat(
@@ -776,8 +793,66 @@ impl BindMountSandbox {
 		Ok(fd)
 	}
 
-	/// If host_path points into a place controllable by the sandboxed
-	/// process, follow_host_symlinks must be false.
+	/// Create a symlink within the sandbox's backing tmpfs, which will
+	/// appear within the sandbox unless the location is already within a
+	/// bind-mount.  linkpath must be absolute, but target need not be (as
+	/// it usually is, relative paths are interpreted relative to the
+	/// symlink's parent directory).
+	pub fn create_symlink(
+		&self,
+		linkpath: &CStr,
+		target: &CStr,
+	) -> Result<(), BindMountSandboxError> {
+		if !linkpath.to_bytes().starts_with(b"/") {
+			panic!("linkpath must be absolute");
+		}
+		let bytes = linkpath.to_bytes_with_nul();
+		let last_slash = bytes
+			.iter()
+			.rposition(|&b| b == b'/')
+			.expect("linkpath is absolute so should have /");
+		let mut parent = CString::new(&bytes[..last_slash]).unwrap();
+		if parent.is_empty() {
+			parent = CString::new("/").unwrap();
+		}
+		let child = CStr::from_bytes_with_nul(&bytes[last_slash..]).unwrap();
+		let parent_fd = self.create_hierarchy(&parent, true)?;
+		unsafe {
+			loop {
+				let res = libc::symlinkat(target.as_ptr(), parent_fd.as_raw_fd(), child.as_ptr());
+				if res != 0 {
+					let err = io::Error::last_os_error();
+					if err.kind() == io::ErrorKind::AlreadyExists {
+						let mut stat: libc::stat = std::mem::zeroed();
+						if libc::fstatat(
+							parent_fd.as_raw_fd(),
+							child.as_ptr(),
+							&mut stat,
+							libc::AT_SYMLINK_NOFOLLOW,
+						) != 0
+						{
+							let err = io::Error::last_os_error();
+							return Err(BindMountSandboxError::StatSandboxPath(err));
+						}
+						let flag = if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+							libc::AT_REMOVEDIR
+						} else {
+							0
+						};
+						let res = libc::unlinkat(parent_fd.as_raw_fd(), child.as_ptr(), flag);
+						if res != 0 {
+							let err = io::Error::last_os_error();
+							return Err(BindMountSandboxError::RemoveSandboxPath(err));
+						}
+						continue;
+					}
+					return Err(BindMountSandboxError::Symlinkat(err));
+				}
+				return Ok(());
+			}
+		}
+	}
+
 	pub(self) fn _mount_host_into_sandbox(
 		&self,
 		host_path: &CStr,
@@ -825,7 +900,7 @@ impl BindMountSandbox {
 			}
 		}
 
-		self.create_hierarchy_within_ns(ns_path, stat.st_mode & libc::S_IFMT == libc::S_IFDIR)?;
+		self.create_hierarchy(ns_path, stat.st_mode & libc::S_IFMT == libc::S_IFDIR)?;
 
 		let nsenter_fn_m0 = unsafe { self.namespaces.nsenter_fn(true, true, false, false) };
 		let nsenter_fn_m1 = unsafe { self.namespaces.nsenter_fn(false, false, true, false) };
@@ -970,6 +1045,10 @@ impl BindMountSandbox {
 		Ok(())
 	}
 
+	/// Join the current thread into the sandbox.  This can be used
+	/// instead of [`Self::run_command`], most likely within a pre_exec
+	/// hook or after fork()ing.  This cannot be used if the current
+	/// process contains more than one threads.
 	pub fn restrict_self(&self) -> Result<(), BindMountSandboxError> {
 		let nsenter_fn = unsafe { self.namespaces.nsenter_fn(true, true, true, true) };
 		let new_cwd = std::env::current_dir().map_err(BindMountSandboxError::Getcwd)?;
@@ -978,6 +1057,9 @@ impl BindMountSandbox {
 		restrict_self_impl(nsenter_fn, &new_cwd_cstr).map_err(BindMountSandboxError::RestrictSelf)
 	}
 
+	/// Run a command within the sandbox.  Can be called more than once
+	/// (unlike
+	/// [`TurnstileTracer::run_command`](crate::tracer::TurnstileTracer::run_command))
 	pub fn run_command(
 		&self,
 		cmd: &mut std::process::Command,
