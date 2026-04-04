@@ -8,7 +8,7 @@ use std::{
 };
 
 use clap::Parser;
-use libturnstile::{BindMountSandbox, MountAttributes};
+use libturnstile::{AccessRequestError, BindMountSandbox, MountAttributes};
 use log::error;
 
 use crate::common::{ProcPidFd, handle_child_result};
@@ -106,6 +106,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 			MountAttributes::rw(),
 		) {
 			error!("Failed to set mount attributes: {e}");
+		}
+	});
+
+	let context_for_thread = context.clone();
+	thread::spawn(move || {
+		let context = context_for_thread;
+		loop {
+			match context.sandbox.tracer.yield_request() {
+				Ok(Some((_, mut ctx))) => {
+					if let Err(e) = ctx.send_continue() {
+						error!("error sending continue response: {}", e);
+					}
+				}
+				Ok(None) => {}
+				Err(e) => {
+					sleep(Duration::from_millis(20));
+					if let Some(pidfd) = context.pidfd.get() {
+						match pidfd.is_alive() {
+							Ok(alive) => {
+								if !alive {
+									break;
+								}
+							}
+							Err(e) => {
+								error!("error checking if child process is alive: {}", e);
+							}
+						}
+					}
+					if let AccessRequestError::InvalidSyscallData(_) = e {
+						continue;
+					}
+					error!("yield_request: {}", e);
+				}
+			}
 		}
 	});
 

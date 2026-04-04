@@ -18,6 +18,8 @@ pub enum TurnstileTracerError {
 	Spawn(std::io::Error),
 	#[error("failed to receive notify fd from child process: {0}")]
 	ReceiveNotifyFd(std::io::Error),
+	#[error("failed to send notify fd to parent process: {0}")]
+	SendNotifyFd(std::io::Error),
 	#[error("failed to resolve syscall {0}: {1}")]
 	ResolveSyscall(&'static str, libseccomp::error::SeccompError),
 	#[error("failed to add filter rule for syscall {0}: {1}")]

@@ -531,7 +531,7 @@ impl MountObj {
 
 #[derive(Debug)]
 pub struct BindMountSandbox {
-	tracer: TurnstileTracer,
+	pub tracer: TurnstileTracer,
 	namespaces: ManagedNamespaces,
 	root_tmpfs: MountObj,
 }
@@ -947,6 +947,14 @@ impl BindMountSandbox {
 		Ok(())
 	}
 
+	/// Spawn a child process inside the sandbox with the seccomp filters
+	/// installed.
+	///
+	/// The caller should arrange to process notifications via
+	/// [`TurnstileTracer::yield_request`] on [`Self::tracer`] on another
+	/// thread before calling this, as this function will block until the
+	/// execve() is done, which will require the caller to allow the file
+	/// access to continue.
 	pub fn run_command(
 		&self,
 		cmd: &mut std::process::Command,
@@ -980,7 +988,6 @@ impl BindMountSandbox {
 				Ok(())
 			})
 		};
-		let child = cmd.spawn().map_err(BindMountSandboxError::Spawn)?;
-		Ok(child)
+		self.tracer.run_command(cmd).map_err(Into::into)
 	}
 }

@@ -51,12 +51,24 @@ pub struct TurnstileTracer {
 	/// Stores the seccomp filter context.
 	pub filter_ctx: Mutex<ScmpFilterContext>,
 
+	/// Raw pointer into the filter context for use in pre_exec-safe code.
+	/// Valid for as long as `filter_ctx` is alive (i.e., for the lifetime
+	/// of this struct).
+	filter_ctx_raw: SendableContextPtr,
+
 	/// Stores the notify fd.
 	///
 	/// Seccomp only gives us the notification fd at filter load time.
 	/// Therefore this is unset until [`Self::install_filters`] or
 	/// [`Self::run_command`] is called.
 	pub notify_fd: OnceLock<ScmpFd>,
+
+	/// Unix socket pair used to transfer the notify fd from a child
+	/// process to the parent.  Index 0 is the parent (receiving) end and
+	/// index 1 is the child (sending) end.  Created in [`Self::new`] and
+	/// consumed (closed) by [`Self::install_filters`] and
+	/// [`Self::receive_notify_fd`].
+	pub(crate) notify_fd_sock_pair: [libc::c_int; 2],
 }
 
 unsafe impl Sync for TurnstileTracer {}
@@ -74,9 +86,28 @@ impl TurnstileTracer {
 		syscalls::fs::add_filter_rules(&mut filter_ctx)?;
 		syscalls::net::add_filter_rules(&mut filter_ctx)?;
 
+		let filter_ctx_raw = SendableContextPtr(filter_ctx.as_ptr());
+
+		let mut notify_fd_sock_pair = [-1i32; 2];
+		unsafe {
+			if libc::socketpair(
+				libc::AF_UNIX,
+				libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+				0,
+				notify_fd_sock_pair.as_mut_ptr(),
+			) != 0
+			{
+				return Err(TurnstileTracerError::Socketpair(
+					std::io::Error::last_os_error(),
+				));
+			}
+		}
+
 		Ok(Self {
 			filter_ctx: Mutex::new(filter_ctx),
+			filter_ctx_raw,
 			notify_fd: OnceLock::new(),
+			notify_fd_sock_pair,
 		})
 	}
 
@@ -175,20 +206,98 @@ impl TurnstileTracer {
 		return Ok(None);
 	}
 
-	/// Load the seccomp filter into the current thread.  Use
-	/// [`Self::run_command`] instead for loading the filter into a child
-	/// process.
-	pub fn install_filters(&self) -> Result<(), TurnstileTracerError> {
-		if self.notify_fd.get().is_some() {
-			panic!("Seccomp filters already loaded elsewhere");
-		}
+	/// Load the seccomp filter into the current process or a forked child.
+	///
+	/// When `send_to_parent` is `false`, the filter is installed in the
+	/// current process and [`Self::notify_fd`] is set.
+	///
+	/// When `send_to_parent` is `true`, this function is intended to be
+	/// called inside a `pre_exec` hook (i.e. after `fork()` but before
+	/// `exec()`).  It loads the filter, sends the resulting notify fd to
+	/// the parent via the child side of [`Self::notify_fd_sock_pair`], and
+	/// then closes the notify fd.  The parent should call
+	/// [`Self::receive_notify_fd`] to receive the notify fd.  This path is
+	/// async-signal-safe: seccomp errors cause a `panic!` and a
+	/// [`TurnstileTracerError::SendNotifyFd`] is returned only if the
+	/// socket send fails.
+	///
+	/// In both cases, both ends of [`Self::notify_fd_sock_pair`] are closed
+	/// unconditionally.
+	pub fn install_filters(&self, send_to_parent: bool) -> Result<(), TurnstileTracerError> {
+		let parent_sock = self.notify_fd_sock_pair[0];
+		let child_sock = self.notify_fd_sock_pair[1];
 
-		let filter_ctx = self.filter_ctx.lock().unwrap();
-		filter_ctx.load().map_err(TurnstileTracerError::Load)?;
-		let notify_fd = filter_ctx
-			.get_notify_fd()
-			.map_err(TurnstileTracerError::NotifyFd)?;
-		self.notify_fd.set(notify_fd).unwrap_or_else(|_| {
+		if send_to_parent {
+			// pre_exec-safe: only async-signal-safe operations.
+			// Seccomp errors use panic!(); only unix_send_fd failure is
+			// returned as an Err.
+			unsafe {
+				libc::close(parent_sock);
+
+				let scmpctx_ptr = self.filter_ctx_raw.into_ptr();
+				let rc = libseccomp_sys::seccomp_load(scmpctx_ptr);
+				if rc != 0 {
+					panic!("seccomp_load failed with error code {}", rc);
+				}
+				let notify_fd_val = libseccomp_sys::seccomp_notify_fd(scmpctx_ptr);
+				if notify_fd_val < 0 {
+					panic!(
+						"seccomp_notify_fd failed with error code {}",
+						-1 * notify_fd_val
+					);
+				}
+
+				let send_result = unix_send_fd(child_sock, notify_fd_val)
+					.map_err(TurnstileTracerError::SendNotifyFd);
+				libc::close(child_sock);
+				libc::close(notify_fd_val);
+				send_result?;
+			}
+		} else {
+			if self.notify_fd.get().is_some() {
+				panic!("Seccomp filters already loaded elsewhere");
+			}
+
+			let filter_ctx = self.filter_ctx.lock().unwrap();
+			let load_result = filter_ctx.load().map_err(TurnstileTracerError::Load);
+			if load_result.is_err() {
+				unsafe {
+					libc::close(parent_sock);
+					libc::close(child_sock);
+				}
+				return load_result;
+			}
+			let notify_fd_result = filter_ctx
+				.get_notify_fd()
+				.map_err(TurnstileTracerError::NotifyFd);
+			unsafe {
+				libc::close(parent_sock);
+				libc::close(child_sock);
+			}
+			let notify_fd_val = notify_fd_result?;
+			self.notify_fd.set(notify_fd_val).unwrap_or_else(|_| {
+				// This can only happen if we race with another thread
+				// also trying to load the filters
+				panic!("Seccomp filters already loaded elsewhere");
+			});
+		}
+		Ok(())
+	}
+
+	/// Receive the notify fd sent by a child process that called
+	/// [`Self::install_filters`] with `send_to_parent: true`.
+	///
+	/// Recvs from the parent side of [`Self::notify_fd_sock_pair`], closes
+	/// that end of the socket, and stores the received fd in
+	/// [`Self::notify_fd`].
+	pub fn receive_notify_fd(&self) -> Result<(), TurnstileTracerError> {
+		let parent_sock = self.notify_fd_sock_pair[0];
+		let recv_res = unix_recv_fd(parent_sock);
+		unsafe {
+			libc::close(parent_sock);
+		}
+		let received_fd = recv_res.map_err(TurnstileTracerError::ReceiveNotifyFd)?;
+		self.notify_fd.set(received_fd).unwrap_or_else(|_| {
 			// This can only happen if we race with another thread
 			// also trying to load the filters
 			panic!("Seccomp filters already loaded elsewhere");
@@ -215,68 +324,31 @@ impl TurnstileTracer {
 			panic!("Seccomp filters already loaded elsewhere");
 		}
 
-		let mut notify_fd_sock = [-1, -1];
-		unsafe {
-			if libc::socketpair(
-				libc::AF_UNIX,
-				libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
-				0,
-				notify_fd_sock.as_mut_ptr(),
-			) != 0
-			{
-				return Err(TurnstileTracerError::Socketpair(
-					std::io::Error::last_os_error(),
-				));
-			}
-		}
-		let child_sock = notify_fd_sock[1];
-		let parent_sock = notify_fd_sock[0];
-		let filter_ctx = self.filter_ctx.lock().unwrap();
-		let scmpctx_ptr = SendableContextPtr(filter_ctx.as_ptr());
-		drop(filter_ctx);
+		let child_sock = self.notify_fd_sock_pair[1];
+		// Cast to usize so the closure is 'static + Send (raw pointers are neither).
+		// Safety: self outlives the pre_exec closure, which is called during
+		// cmd.spawn() while we still hold &self.
+		let self_ptr = self as *const TurnstileTracer as usize;
 		unsafe {
 			cmd.pre_exec(move || {
-				// Everything in this function must be async-signal-safe,
-				// so no logging code aside from printing a &'static str,
-				// etc.
-
-				libc::close(parent_sock);
-
-				let scmpctx_ptr = scmpctx_ptr.into_ptr();
-				let rc = libseccomp_sys::seccomp_load(scmpctx_ptr);
-				if rc != 0 {
-					panic!("seccomp_load failed with error code {}", rc);
-				}
-				let notify_fd = libseccomp_sys::seccomp_notify_fd(scmpctx_ptr);
-				if notify_fd < 0 {
-					panic!(
-						"seccomp_notify_fd failed with error code {}",
-						-1 * notify_fd
-					);
-				}
-
-				// Send notify_fd to the parent via SCM_RIGHTS.
-				unix_send_fd(child_sock, notify_fd)?;
-
-				libc::close(child_sock);
-				libc::close(notify_fd);
+				// Everything in this function must be async-signal-safe.
+				// Safety: self outlives the pre_exec closure (called during
+				// cmd.spawn() while &self is held), and TurnstileTracer is
+				// Sync so shared access from this thread is sound.
+				let tracer = &*(self_ptr as *const TurnstileTracer);
+				tracer.install_filters(true).map_err(|e| match e {
+					TurnstileTracerError::SendNotifyFd(io_err) => io_err,
+					// All other error paths in install_filters(true) panic,
+					// so this branch is unreachable.
+					_ => unreachable!(),
+				})?;
 				Ok(())
 			});
 		}
 
 		thread::scope(|s| -> Result<std::process::Child, TurnstileTracerError> {
 			let jh = s.spawn(|| -> Result<(), TurnstileTracerError> {
-				let recv_res = unix_recv_fd(parent_sock);
-				unsafe {
-					libc::close(parent_sock);
-				}
-				let received_fd = recv_res.map_err(TurnstileTracerError::ReceiveNotifyFd)?;
-				self.notify_fd.set(received_fd).unwrap_or_else(|_| {
-					// This can only happen if we race with another thread
-					// also trying to load the filters
-					panic!("Seccomp filters already loaded elsewhere");
-				});
-				Ok(())
+				self.receive_notify_fd()
 			});
 			let spawn_res = cmd.spawn();
 			unsafe {
@@ -298,7 +370,7 @@ impl TurnstileTracer {
 	}
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 struct SendableContextPtr(scmp_filter_ctx);
 unsafe impl Send for SendableContextPtr {}
 unsafe impl Sync for SendableContextPtr {}
