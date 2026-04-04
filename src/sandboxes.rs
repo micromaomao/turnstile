@@ -10,7 +10,7 @@ use log::{debug, error, info};
 use smallvec::SmallVec;
 
 use crate::{
-	BindMountSandboxError, TurnstileTracer,
+	BindMountSandboxError,
 	fs::ForeignFd,
 	utils::{fork_wait, unix_recv_fd, unix_send_fd},
 };
@@ -531,7 +531,6 @@ impl MountObj {
 
 #[derive(Debug)]
 pub struct BindMountSandbox {
-	tracer: TurnstileTracer,
 	namespaces: ManagedNamespaces,
 	root_tmpfs: MountObj,
 }
@@ -577,7 +576,6 @@ impl<'a, 'b> MountBuilder<'a, 'b> {
 
 impl BindMountSandbox {
 	pub fn new(disable_userns: bool) -> Result<Self, BindMountSandboxError> {
-		let tracer = TurnstileTracer::new().map_err(BindMountSandboxError::TurnstileTracerError)?;
 		let namespaces = ManagedNamespaces::new(disable_userns)?;
 		let root_tmpfs = unsafe {
 			MountObj::new_from_fd(thread::scope(
@@ -647,7 +645,6 @@ impl BindMountSandbox {
 			)?)
 		};
 		let s = Self {
-			tracer,
 			namespaces,
 			root_tmpfs,
 		};
