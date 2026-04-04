@@ -1,7 +1,7 @@
-use core::panic;
 use std::{
 	cell::Cell,
 	ffi::CStr,
+	io::Write,
 	os::unix::process::CommandExt,
 	sync::{
 		OnceLock,
@@ -51,15 +51,15 @@ unsafe fn install_filters_impl(
 	parent_sock: libc::c_int,
 	child_sock: libc::c_int,
 	send_to_parent: bool,
-) -> std::io::Result<Option<ScmpFd>> {
+) -> Result<Option<ScmpFd>, TurnstileTracerError> {
 	unsafe {
 		let rc = libseccomp_sys::seccomp_load(ctx_ptr);
 		if rc != 0 {
-			panic!("seccomp_load failed with error code {}", rc);
+			return Err(TurnstileTracerError::Load(rc));
 		}
 		let notify_fd = libseccomp_sys::seccomp_notify_fd(ctx_ptr);
 		if notify_fd < 0 {
-			panic!("seccomp_notify_fd failed with error code {}", -notify_fd);
+			return Err(TurnstileTracerError::NotifyFd(notify_fd));
 		}
 
 		let send_result = if send_to_parent {
@@ -74,7 +74,7 @@ unsafe fn install_filters_impl(
 		libc::close(parent_sock);
 		libc::close(child_sock);
 
-		send_result?;
+		send_result.map_err(TurnstileTracerError::SendNotifyFd)?;
 		if send_to_parent {
 			Ok(None)
 		} else {
@@ -319,7 +319,7 @@ impl TurnstileTracer {
 	///
 	/// This function can only be called once, and is also mutually
 	/// exclusive with [`Self::run_command`].
-	pub fn install_filters(&self, send_to_parent: bool) -> std::io::Result<()> {
+	pub fn install_filters(&self, send_to_parent: bool) -> Result<(), TurnstileTracerError> {
 		let [parent_sock, child_sock] = self.notify_fd_state.take_sock_pair();
 		let ctx_ptr = self.filter_ctx.as_ptr();
 		unsafe {
@@ -376,8 +376,26 @@ impl TurnstileTracer {
 		unsafe {
 			cmd.pre_exec(move || {
 				// both sock fds in child closed in this function
-				install_filters_impl(ctx_ptr.into_ptr(), parent_sock, child_sock, true)?;
-				Ok(())
+				match install_filters_impl(ctx_ptr.into_ptr(), parent_sock, child_sock, true) {
+					Ok(_) => return Ok(()),
+					Err(e) => {
+						let mut buf = [0; 512];
+						let buflen = buf.len();
+						let mut bufwrite = &mut buf[..];
+						let _ = write!(
+							bufwrite,
+							"Failed to install filters in child process: {}",
+							e
+						);
+						let count = buflen - bufwrite.len();
+						libc::write(
+							libc::STDERR_FILENO,
+							buf.as_ptr() as *const libc::c_void,
+							count,
+						);
+						return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+					}
+				}
 			});
 		}
 

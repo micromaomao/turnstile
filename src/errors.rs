@@ -5,23 +5,28 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 pub enum TurnstileTracerError {
 	#[error("seccomp_init : {0}")]
-	Init(libseccomp::error::SeccompError),
+	Init(#[source] libseccomp::error::SeccompError),
 	#[error("seccomp_arch_add : {0}")]
-	AddArch(libseccomp::error::SeccompError),
-	#[error("seccomp_load : {0}")]
-	Load(libseccomp::error::SeccompError),
-	#[error("seccomp_notify_fd : {0}")]
-	NotifyFd(libseccomp::error::SeccompError),
+	AddArch(#[source] libseccomp::error::SeccompError),
+	#[error("seccomp_load failed with error code {0}")]
+	Load(libc::c_int),
+	#[error("seccomp_notify_fd failed with error code {0}")]
+	NotifyFd(libc::c_int),
 	#[error("socketpair: {0}")]
-	Socketpair(std::io::Error),
+	Socketpair(#[source] std::io::Error),
 	#[error("failed to spawn child process: {0}")]
-	Spawn(std::io::Error),
+	Spawn(#[source] std::io::Error),
+	#[error("failed to send notify fd to parent process: {0}")]
+	SendNotifyFd(#[source] std::io::Error),
 	#[error("failed to receive notify fd from child process: {0}")]
-	ReceiveNotifyFd(std::io::Error),
+	ReceiveNotifyFd(#[source] std::io::Error),
 	#[error("failed to resolve syscall {0}: {1}")]
-	ResolveSyscall(&'static str, libseccomp::error::SeccompError),
+	ResolveSyscall(&'static str, #[source] libseccomp::error::SeccompError),
 	#[error("failed to add filter rule for syscall {0}: {1}")]
-	AddRule(libseccomp::ScmpSyscall, libseccomp::error::SeccompError),
+	AddRule(
+		libseccomp::ScmpSyscall,
+		#[source] libseccomp::error::SeccompError,
+	),
 }
 
 #[derive(Error, Debug)]
