@@ -3,7 +3,8 @@ name = "libturnstile"
 version = "0.2.0"
 edition = "2024"
 license = "MIT"
-description = "Seccomp-unotify-based access tracer"
+description = "Seccomp-unotify access tracer and namespace-based sandboxing library"
+repository = "https://github.com/micromaomao/libturnstile"
 autobins = false
 
 [dependencies]

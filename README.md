@@ -1,4 +1,6 @@
-# Tools and library for "interactive" sandboxing
+# libturnstile
+
+[![crates.io](https://img.shields.io/crates/v/libturnstile?style=flat)](https://crates.io/crates/libturnstile)
 
 Turnstile implements a
 [seccomp-unotify](https://man7.org/linux/man-pages/man2/seccomp_unotify.2.html)-based
