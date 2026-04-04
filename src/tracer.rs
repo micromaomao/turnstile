@@ -51,7 +51,7 @@ unsafe fn install_filters_impl(
 	parent_sock: libc::c_int,
 	child_sock: libc::c_int,
 	send_to_parent: bool,
-) -> std::io::Result<ScmpFd> {
+) -> std::io::Result<Option<ScmpFd>> {
 	unsafe {
 		let rc = libseccomp_sys::seccomp_load(ctx_ptr);
 		if rc != 0 {
@@ -63,18 +63,23 @@ unsafe fn install_filters_impl(
 		}
 
 		let send_result = if send_to_parent {
-			let r = unix_send_fd(child_sock, notify_fd);
-			libc::close(notify_fd);
-			r
+			unix_send_fd(child_sock, notify_fd)
 		} else {
 			Ok(())
 		};
 
+		if send_to_parent {
+			libc::close(notify_fd);
+		}
 		libc::close(parent_sock);
 		libc::close(child_sock);
 
 		send_result?;
-		Ok(notify_fd)
+		if send_to_parent {
+			Ok(None)
+		} else {
+			Ok(Some(notify_fd))
+		}
 	}
 }
 
@@ -297,7 +302,7 @@ impl TurnstileTracer {
 		return Ok(None);
 	}
 
-	/// Load the seccomp filter into the current process.
+	/// Load the seccomp filter into the current thread.
 	///
 	/// This function is safe to call from a pre_exec hook.
 	///
@@ -307,8 +312,9 @@ impl TurnstileTracer {
 	/// [`Self::receive_notify_fd`] from another thread before calling
 	/// this function in a forked child to receive the notify fd.
 	///
-	/// If `send_to_parent` is false, stores the notify fd in
-	/// `self.notify_fd` directly.
+	/// If `send_to_parent` is false, stores the notify fd internally,
+	/// such that [`Self::yield_request`] can be used to handle access
+	/// requests made by this process itself.
 	///
 	/// This function can only be called once, and is also mutually
 	/// exclusive with [`Self::run_command`].
@@ -318,7 +324,7 @@ impl TurnstileTracer {
 		unsafe {
 			let notify_fd = install_filters_impl(ctx_ptr, parent_sock, child_sock, send_to_parent)?;
 			if !send_to_parent {
-				self.notify_fd_state.store_notify_fd(notify_fd);
+				self.notify_fd_state.store_notify_fd(notify_fd.unwrap());
 			}
 		}
 		Ok(())
