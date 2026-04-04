@@ -304,13 +304,14 @@ impl TurnstileTracer {
 
 	/// Load the seccomp filter into the current thread.
 	///
-	/// This function is safe to call from a pre_exec hook.
+	/// This function is safe to call from a pre_exec hook, but in such
+	/// cases one may wish to use [`Self::run_command`] instead.
 	///
 	/// If `send_to_parent` is true, sends the seccomp notify fd to a
 	/// parent process via the internal socket pair, then closes the
 	/// notify fd in this process.  The parent should call
-	/// [`Self::receive_notify_fd`] from another thread before calling
-	/// this function in a forked child to receive the notify fd.
+	/// [`Self::receive_notify_fd`] after forking to receive the notify
+	/// fd.
 	///
 	/// If `send_to_parent` is false, stores the notify fd internally,
 	/// such that [`Self::yield_request`] can be used to handle access
