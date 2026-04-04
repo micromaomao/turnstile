@@ -725,14 +725,14 @@ impl BindMountSandbox {
 						}
 					} else {
 						let newfd = ForeignFd { local_fd: newfd };
-						// todo!("Check if it's a directory when we expect it to be, and recreate to fix it if not.");
 						let mut stat: libc::stat = std::mem::zeroed();
 						if libc::fstat(newfd.as_raw_fd(), &mut stat) != 0 {
 							let err = io::Error::last_os_error();
 							return Err(BindMountSandboxError::StatSandboxPath(err));
 						}
 						let is_dir = stat.st_mode & libc::S_IFMT == libc::S_IFDIR;
-						if is_dir == leaf_is_dir {
+						let expect_is_dir = !is_leaf || leaf_is_dir;
+						if is_dir == expect_is_dir {
 							break newfd;
 						}
 						let ret = libc::unlinkat(

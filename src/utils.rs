@@ -85,6 +85,11 @@ pub fn unix_recv_fd(sock: libc::c_int) -> std::io::Result<libc::c_int> {
 	Ok(received_fd)
 }
 
+/// ## Safety
+///
+/// `f` must be async signal safe.  This means no allocations (because
+/// they may deadlock in the child), avoiding most std library functions,
+/// and no panics.
 pub unsafe fn fork_wait<F: FnOnce() -> libc::c_int + Send>(f: F) -> std::io::Result<libc::c_int> {
 	unsafe {
 		match libc::fork() {
