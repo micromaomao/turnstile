@@ -2,8 +2,91 @@ use std::{
 	collections::{HashMap, hash_map},
 	ffi::{OsStr, OsString},
 	fmt::Display,
+	iter::FusedIterator,
 	os::unix::ffi::OsStrExt,
 };
+
+struct PathToComponentsIter<'a> {
+	path_bytes: &'a [u8],
+	next_start: usize,
+}
+
+struct PathComponent<'a> {
+	pub name: &'a OsStr,
+	pub path_from_root: &'a OsStr,
+	pub parent_path_from_root: &'a OsStr,
+	pub remaining: &'a OsStr,
+}
+
+impl<'a> PathComponent<'a> {
+	pub fn is_last(&self) -> bool {
+		self.remaining.is_empty()
+	}
+}
+
+impl<'a> Iterator for PathToComponentsIter<'a> {
+	type Item = PathComponent<'a>;
+
+	fn next(&mut self) -> Option<Self::Item> {
+		loop {
+			if self.next_start >= self.path_bytes.len() {
+				return None;
+			}
+			let parent_abs = if self.next_start == 0 {
+				OsStr::new("")
+			} else {
+				OsStr::from_bytes(&self.path_bytes[..self.next_start - 1])
+			};
+			let next_slash = self.path_bytes[self.next_start..]
+				.iter()
+				.copied()
+				.position(|b| b == b'/');
+			let curr_start = self.next_start;
+			let end;
+			if let Some(next_slash) = next_slash {
+				self.next_start += next_slash + 1;
+				end = self.next_start - 1;
+			} else {
+				self.next_start = self.path_bytes.len();
+				end = self.path_bytes.len();
+			}
+			let current = &self.path_bytes[curr_start..end];
+			let current_abs = &self.path_bytes[..end];
+			let remaining = &self.path_bytes[self.next_start..];
+			if current.is_empty() {
+				continue;
+			}
+			return Some(PathComponent {
+				name: OsStr::from_bytes(current),
+				path_from_root: OsStr::from_bytes(current_abs),
+				parent_path_from_root: parent_abs,
+				remaining: OsStr::from_bytes(remaining),
+			});
+		}
+	}
+
+	fn size_hint(&self) -> (usize, Option<usize>) {
+		if self.next_start >= self.path_bytes.len() {
+			return (0, Some(0));
+		}
+		let remaining = &self.path_bytes[self.next_start..];
+		let len = remaining
+			.split(|&b| b == b'/')
+			.filter(|s| !s.is_empty())
+			.count();
+		(len, Some(len))
+	}
+}
+
+impl<'a> FusedIterator for PathToComponentsIter<'a> {}
+impl<'a> ExactSizeIterator for PathToComponentsIter<'a> {}
+
+fn path_to_components<'a>(path: &'a OsStr) -> PathToComponentsIter<'a> {
+	PathToComponentsIter {
+		path_bytes: path.as_encoded_bytes(),
+		next_start: 0,
+	}
+}
 
 #[derive(Debug, Clone)]
 struct FsTreeNode<T> {
@@ -77,35 +160,23 @@ impl<'a, T> Entry<'a, T> {
 						children: HashMap::new(),
 					}
 				});
-				let mut iter = missing_path_afterwards
-					.as_bytes()
-					.split(|&b| b == b'/')
-					.filter(|s| !s.is_empty())
-					.peekable();
-				loop {
-					match iter.next() {
-						Some(comp) => {
-							let comp_os = OsStr::from_bytes(comp);
-							built_up_prefix.push(OsStr::new("/"));
-							built_up_prefix.push(comp_os);
-							current =
-								current
-									.children
-									.entry(comp_os.to_owned())
-									.or_insert_with(|| {
-										let target = if iter.peek().is_some() {
-											create_missing_parent(&built_up_prefix)
-										} else {
-											create_node.take().unwrap()(&built_up_prefix)
-										};
-										FsTreeNode {
-											target,
-											children: HashMap::new(),
-										}
-									});
-						}
-						None => break,
-					}
+				for comp in path_to_components(&missing_path_afterwards) {
+					built_up_prefix.push(OsStr::new("/"));
+					built_up_prefix.push(comp.name);
+					current = current
+						.children
+						.entry(comp.name.to_owned())
+						.or_insert_with(|| {
+							let target = if !comp.is_last() {
+								create_missing_parent(&built_up_prefix)
+							} else {
+								create_node.take().unwrap()(&built_up_prefix)
+							};
+							FsTreeNode {
+								target,
+								children: HashMap::new(),
+							}
+						});
 				}
 				&mut current.target
 			}
@@ -130,11 +201,9 @@ impl<T> FsTree<T> {
 	}
 
 	pub fn get(&self, path: &OsStr) -> Option<&T> {
-		let pathb = path.as_bytes();
 		let mut current = &self.root;
-		for comp in pathb.split(|&b| b == b'/').filter(|comp| !comp.is_empty()) {
-			let comp_os = OsStr::from_bytes(comp);
-			if let Some(v) = current.children.get(comp_os) {
+		for comp in path_to_components(path) {
+			if let Some(v) = current.children.get(comp.name) {
 				current = v;
 			} else {
 				return None;
@@ -144,11 +213,9 @@ impl<T> FsTree<T> {
 	}
 
 	pub fn get_mut(&mut self, path: &OsStr) -> Option<&mut T> {
-		let pathb = path.as_bytes();
 		let mut current = &mut self.root;
-		for comp in pathb.split(|&b| b == b'/').filter(|comp| !comp.is_empty()) {
-			let comp_os = OsStr::from_bytes(comp);
-			if let Some(v) = current.children.get_mut(comp_os) {
+		for comp in path_to_components(path) {
+			if let Some(v) = current.children.get_mut(comp.name) {
 				current = v;
 			} else {
 				return None;
@@ -157,52 +224,46 @@ impl<T> FsTree<T> {
 		Some(&mut current.target)
 	}
 
+	/// Return either the path's tree node itself, or the closest parent,
+	/// and its path.
+	pub fn find<'a>(&mut self, path: &'a OsStr) -> (&'a OsStr, &T) {
+		let mut current = &self.root;
+		for comp in path_to_components(path) {
+			if let Some(v) = current.children.get(comp.name) {
+				current = v;
+			} else {
+				return (comp.parent_path_from_root, &current.target);
+			}
+		}
+		(path, &current.target)
+	}
+
 	pub fn entry(&mut self, path: &OsStr) -> Entry<'_, T> {
-		let pathb = path.as_bytes();
-		let mut current = Some(&mut self.root);
-		let components = pathb.split(|&b| b == b'/').filter(|comp| !comp.is_empty());
-		let mut iter = components.into_iter();
-		let mut built_up_prefix = OsString::new();
-		loop {
-			let comp = iter.next();
-			match comp {
-				None => {
+		let mut current = &mut self.root;
+		for comp in path_to_components(path) {
+			if current.children.contains_key(comp.name) {
+				current = current.children.get_mut(comp.name).unwrap();
+			} else {
+				let entry = current.children.entry(comp.name.to_owned());
+				if comp.is_last() {
 					return Entry {
-						state: EntryState::Exist(current.unwrap()),
-						path: built_up_prefix,
+						state: EntryState::PlaceIn { entry },
+						path: comp.path_from_root.to_owned(),
+					};
+				} else {
+					return Entry {
+						state: EntryState::ParentMissing {
+							first_child_entry: entry,
+							missing_path_afterwards: comp.remaining.to_owned(),
+						},
+						path: comp.path_from_root.to_owned(),
 					};
 				}
-				Some(comp) => {
-					let comp_os = OsStr::from_bytes(comp);
-					built_up_prefix.push(comp_os);
-					if let Some(_) = current.as_mut().unwrap().children.get_mut(comp_os) {
-						current = Some(current.take().unwrap().children.get_mut(comp_os).unwrap());
-					} else {
-						let entry = current.take().unwrap().children.entry(comp_os.to_owned());
-						let mut remaining_path = OsString::new();
-						while let Some(next) = iter.next() {
-							if !remaining_path.is_empty() {
-								remaining_path.push(OsStr::new("/"));
-							}
-							remaining_path.push(OsStr::from_bytes(next));
-						}
-						if remaining_path.is_empty() {
-							return Entry {
-								state: EntryState::PlaceIn { entry },
-								path: built_up_prefix,
-							};
-						} else {
-							return Entry {
-								state: EntryState::ParentMissing {
-									first_child_entry: entry,
-									missing_path_afterwards: remaining_path,
-								},
-								path: built_up_prefix,
-							};
-						}
-					}
-				}
 			}
+		}
+		Entry {
+			state: EntryState::Exist(current),
+			path: path.to_owned(),
 		}
 	}
 
@@ -218,12 +279,7 @@ impl<T> FsTree<T> {
 		path: &OsStr,
 		mut drain: F,
 	) {
-		let pathb = path.as_bytes();
 		let mut current = &mut self.root;
-		let mut iter = pathb
-			.split(|&b| b == b'/')
-			.filter(|comp| !comp.is_empty())
-			.peekable();
 		fn helper<T, F: FnMut(&OsStr, &mut T) -> bool>(
 			current: &mut FsTreeNode<T>,
 			pathbuf: &mut Vec<u8>,
@@ -242,40 +298,30 @@ impl<T> FsTree<T> {
 			let should_remove = drain(OsStr::from_bytes(pathbuf), &mut current.target);
 			should_remove
 		}
-		loop {
-			let comp = iter.next();
-			match comp {
-				None => {
-					// root
-					helper(current, &mut Vec::new(), &mut drain);
-					return;
-				}
-				Some(comp) => {
-					let comp_os = OsStr::from_bytes(comp);
-					if let Some(_) = current.children.get(comp_os) {
-						if iter.peek().is_none() {
-							// remove children of current/comp
-							let mut pathbuf = pathb.to_vec();
-							let mut comp_entry = current.children.remove_entry(comp_os).unwrap();
-							if helper(&mut comp_entry.1, &mut pathbuf, &mut drain) {
-								// remove current/comp itself
-								let should_remove =
-									drain(OsStr::from_bytes(pathb), &mut comp_entry.1.target);
-								if !should_remove {
-									current.children.insert(comp_entry.0, comp_entry.1);
-								}
-								return;
-							}
-						} else {
-							current = current.children.get_mut(comp_os).unwrap();
+		for comp in path_to_components(path) {
+			if current.children.contains_key(comp.name) {
+				if comp.is_last() {
+					// remove children of current/comp
+					let mut pathbuf = comp.path_from_root.as_bytes().to_vec();
+					let mut comp_entry = current.children.remove_entry(comp.name).unwrap();
+					if helper(&mut comp_entry.1, &mut pathbuf, &mut drain) {
+						// remove current/comp itself
+						let should_remove = drain(comp.path_from_root, &mut comp_entry.1.target);
+						if !should_remove {
+							current.children.insert(comp_entry.0, comp_entry.1);
 						}
-					} else {
-						// path doesn't exist, so nothing to drain
-						return;
 					}
+					return;
+				} else {
+					current = current.children.get_mut(comp.name).unwrap();
 				}
+			} else {
+				// path doesn't exist, so nothing to drain
+				return;
 			}
 		}
+		// root (no components, or path was empty/"/")
+		helper(current, &mut Vec::new(), &mut drain);
 	}
 
 	/// Given a subtree, if it is empty, call drain to decide if it should
@@ -287,11 +333,7 @@ impl<T> FsTree<T> {
 		path: &OsStr,
 		mut drain: F,
 	) -> bool {
-		let pathb = path.as_bytes();
-		let components: Vec<&[u8]> = pathb
-			.split(|&b| b == b'/')
-			.filter(|comp| !comp.is_empty())
-			.collect();
+		let components: Vec<&OsStr> = path_to_components(path).map(|c| c.name).collect();
 
 		if components.is_empty() {
 			return false;
@@ -301,7 +343,7 @@ impl<T> FsTree<T> {
 
 		fn helper<T, F: FnMut(&OsStr, &mut T) -> bool>(
 			node: &mut FsTreeNode<T>,
-			components: &[&[u8]],
+			components: &[&OsStr],
 			depth: usize,
 			path_buf: &mut Vec<u8>,
 			drain: &mut F,
@@ -311,8 +353,7 @@ impl<T> FsTree<T> {
 				return node.children.is_empty();
 			}
 
-			let comp = components[depth];
-			let comp_os = OsStr::from_bytes(comp);
+			let comp_os = components[depth];
 
 			if !node.children.contains_key(comp_os) {
 				return false;
@@ -322,7 +363,7 @@ impl<T> FsTree<T> {
 			if !path_buf.is_empty() {
 				path_buf.push(b'/');
 			}
-			path_buf.extend_from_slice(comp);
+			path_buf.extend_from_slice(comp_os.as_bytes());
 
 			let child = node.children.get_mut(comp_os).unwrap();
 			let should_remove = helper(child, components, depth + 1, path_buf, drain, any_removed);
