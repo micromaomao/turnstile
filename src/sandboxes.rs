@@ -1,7 +1,7 @@
 use std::{
 	borrow::Cow,
 	ffi::{CStr, CString, OsStr},
-	io,
+	io, mem,
 	os::{fd::AsRawFd, unix::process::CommandExt},
 	thread,
 };
@@ -541,7 +541,7 @@ pub struct MountBuilder<'a, 'b> {
 	sandbox_path: &'a CStr,
 	attrs: MountAttributes,
 	follow_host_symlinks: bool,
-	follow_sandbox_symlinks: bool,
+	// follow_sandbox_symlinks: bool,
 	sandbox: &'b BindMountSandbox,
 }
 
@@ -552,16 +552,18 @@ impl<'a, 'b> MountBuilder<'a, 'b> {
 	}
 
 	/// If host path points into a location controllable or writable by
-	/// the sandboxed process, this must not be used.
+	/// the sandboxed process, this must not be used.  This only affects
+	/// the path resolution for the "source" side - symlinks are still not
+	/// followed when resolving the mount destination.
 	pub fn follow_host_symlinks(&mut self, follow: bool) -> &mut Self {
 		self.follow_host_symlinks = follow;
 		self
 	}
 
-	pub fn follow_sandbox_symlinks(&mut self, follow: bool) -> &mut Self {
-		self.follow_sandbox_symlinks = follow;
-		self
-	}
+	// pub fn follow_sandbox_symlinks(&mut self, follow: bool) -> &mut Self {
+	// 	self.follow_sandbox_symlinks = follow;
+	// 	self
+	// }
 
 	pub fn mount(self) -> Result<(), BindMountSandboxError> {
 		self.sandbox._mount_host_into_sandbox(
@@ -569,7 +571,8 @@ impl<'a, 'b> MountBuilder<'a, 'b> {
 			self.sandbox_path,
 			self.attrs,
 			self.follow_host_symlinks,
-			self.follow_sandbox_symlinks,
+			// self.follow_sandbox_symlinks,
+			false,
 		)
 	}
 }
@@ -717,11 +720,19 @@ impl BindMountSandbox {
 			let is_leaf = i == len - 1;
 			let newfd = loop {
 				unsafe {
-					let newfd = libc::openat(
+					let mut openhow: libc::open_how = mem::zeroed();
+					openhow.flags = (libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
+					openhow.resolve = libc::RESOLVE_NO_SYMLINKS;
+					if i == 0 {
+						openhow.resolve |= libc::RESOLVE_IN_ROOT;
+					}
+					let newfd = libc::syscall(
+						libc::SYS_openat2,
 						fd.as_raw_fd(),
 						comp.as_ptr(),
-						libc::O_PATH | libc::O_CLOEXEC,
-					);
+						&openhow as *const _,
+						std::mem::size_of::<libc::open_how>(),
+					) as libc::c_int;
 					if newfd < 0 {
 						let err = io::Error::last_os_error();
 						if err.kind() == io::ErrorKind::NotFound {
@@ -741,7 +752,7 @@ impl BindMountSandbox {
 									let ret = libc::openat(
 										fd.as_raw_fd(),
 										comp.as_ptr(),
-										libc::O_CREAT | libc::O_WRONLY,
+										libc::O_CREAT | libc::O_WRONLY | libc::O_NOFOLLOW,
 										0o644,
 									);
 									if ret < 0 {
@@ -839,6 +850,8 @@ impl BindMountSandbox {
 						} else {
 							0
 						};
+						// unlinkat never follows symlink on the final
+						// path component
 						let res = libc::unlinkat(parent_fd.as_raw_fd(), child.as_ptr(), flag);
 						if res != 0 {
 							let err = io::Error::last_os_error();
@@ -853,6 +866,9 @@ impl BindMountSandbox {
 		}
 	}
 
+	// todo: the semantic of follow_ns_symlinks is ill-defined due to use
+	// of create_hierarchy, which has no visibility into bind-mounted
+	// symlinks
 	pub(self) fn _mount_host_into_sandbox(
 		&self,
 		host_path: &CStr,
@@ -991,7 +1007,7 @@ impl BindMountSandbox {
 			sandbox_path,
 			attrs: MountAttributes::default(),
 			follow_host_symlinks: false,
-			follow_sandbox_symlinks: false,
+			// follow_sandbox_symlinks: false,
 			sandbox: self,
 		}
 	}
@@ -1021,7 +1037,16 @@ impl BindMountSandbox {
 				if res != 0 {
 					return perror!("chdir");
 				}
-				let fd = libc::open(ns_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC);
+				let mut openhow: libc::open_how = mem::zeroed();
+				openhow.flags = (libc::O_PATH | libc::O_CLOEXEC) as u64;
+				openhow.resolve = libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_IN_ROOT;
+				let fd = libc::syscall(
+					libc::SYS_openat2,
+					libc::AT_FDCWD,
+					ns_path.as_ptr(),
+					&openhow,
+					std::mem::size_of_val(&openhow),
+				) as libc::c_int;
 				if fd < 0 {
 					return perror!("open");
 				}
