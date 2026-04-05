@@ -822,7 +822,7 @@ impl BindMountSandbox {
 		if parent.is_empty() {
 			parent = CString::new("/").unwrap();
 		}
-		let child = CStr::from_bytes_with_nul(&bytes[last_slash..]).unwrap();
+		let child = CStr::from_bytes_with_nul(&bytes[last_slash + 1..]).unwrap();
 		let parent_fd = self.create_placeholder_hierarchy(&parent, true)?;
 		unsafe {
 			loop {
