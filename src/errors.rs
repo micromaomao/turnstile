@@ -103,4 +103,6 @@ pub enum BindMountSandboxError {
 	StatSandboxPath(#[source] std::io::Error),
 	#[error("Failed to remove path within sandbox: {0}")]
 	RemoveSandboxPath(#[source] std::io::Error),
+	#[error("Invalid sandbox path: {0}: {1:?}")]
+	InvalidSandboxPath(&'static str, CString),
 }

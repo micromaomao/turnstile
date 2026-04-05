@@ -525,6 +525,37 @@ impl MountObj {
 	}
 }
 
+fn validate_sandbox_path(path: &CStr) -> Result<(), BindMountSandboxError> {
+	let bytes = path.to_bytes();
+	if !bytes.starts_with(b"/") {
+		return Err(BindMountSandboxError::InvalidSandboxPath(
+			"path must be absolute",
+			path.to_owned(),
+		));
+	}
+	if bytes.len() > 1 && bytes.ends_with(b"/") {
+		return Err(BindMountSandboxError::InvalidSandboxPath(
+			"path must not have a trailing '/'",
+			path.to_owned(),
+		));
+	}
+	for component in bytes[1..].split(|&b| b == b'/') {
+		if component.is_empty() {
+			return Err(BindMountSandboxError::InvalidSandboxPath(
+				"path must not contain consecutive '/'",
+				path.to_owned(),
+			));
+		}
+		if component == b"." || component == b".." {
+			return Err(BindMountSandboxError::InvalidSandboxPath(
+				"path must not contain '.' or '..' components",
+				path.to_owned(),
+			));
+		}
+	}
+	Ok(())
+}
+
 #[derive(Debug)]
 pub struct BindMountSandbox {
 	namespaces: ManagedNamespaces,
@@ -700,9 +731,7 @@ impl BindMountSandbox {
 		path: &CStr,
 		leaf_is_dir: bool,
 	) -> Result<ForeignFd, BindMountSandboxError> {
-		if !path.to_bytes().starts_with(b"/") {
-			panic!("path must be absolute");
-		}
+		validate_sandbox_path(path)?;
 
 		let mut fd = self.root_tmpfs.0.clone();
 		let components = path
@@ -810,9 +839,7 @@ impl BindMountSandbox {
 		linkpath: &CStr,
 		target: &CStr,
 	) -> Result<(), BindMountSandboxError> {
-		if !linkpath.to_bytes().starts_with(b"/") {
-			panic!("linkpath must be absolute");
-		}
+		validate_sandbox_path(linkpath)?;
 		let bytes = linkpath.to_bytes_with_nul();
 		let last_slash = bytes
 			.iter()
@@ -868,9 +895,7 @@ impl BindMountSandbox {
 	/// directory.  Nothing is done if the path, or any of its parent
 	/// components, doesn't exist.
 	pub fn remove_placeholder(&self, path: &CStr) -> Result<(), BindMountSandboxError> {
-		if !path.to_bytes().starts_with(b"/") {
-			panic!("path must be absolute");
-		}
+		validate_sandbox_path(path)?;
 
 		let bytes = path.to_bytes_with_nul();
 		let last_slash = bytes
@@ -886,7 +911,10 @@ impl BindMountSandbox {
 		};
 		let leaf = CStr::from_bytes_with_nul(&bytes[last_slash + 1..]).unwrap();
 		if leaf.to_bytes().is_empty() {
-			panic!("cannot remove root");
+			return Err(BindMountSandboxError::InvalidSandboxPath(
+				"cannot remove root",
+				path.to_owned(),
+			));
 		}
 
 		// Open the parent directory in one shot
@@ -1048,9 +1076,7 @@ impl BindMountSandbox {
 		follow_host_symlinks: bool,
 		follow_ns_symlinks: bool,
 	) -> Result<(), BindMountSandboxError> {
-		if !ns_path.to_bytes().starts_with(b"/") {
-			panic!("ns_path must be an absolute path");
-		}
+		validate_sandbox_path(ns_path)?;
 		let mut open_how: libc::open_how = unsafe { std::mem::zeroed() };
 		open_how.flags = (libc::O_PATH | libc::O_CLOEXEC) as u64;
 		if !follow_host_symlinks {
@@ -1194,9 +1220,7 @@ impl BindMountSandbox {
 		attrs: MountAttributes,
 		existing_attrs: MountAttributes,
 	) -> Result<(), BindMountSandboxError> {
-		if !ns_path.to_bytes().starts_with(b"/") {
-			panic!("ns_path must be an absolute path");
-		}
+		validate_sandbox_path(ns_path)?;
 		let nsenter_fn = unsafe { self.namespaces.nsenter_fn(true, true, true, false) };
 		let fork_res = unsafe {
 			fork_wait(|| {
