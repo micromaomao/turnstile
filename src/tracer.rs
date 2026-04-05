@@ -14,8 +14,8 @@ use libseccomp::{ScmpArch, ScmpFd, ScmpFilterContext, ScmpNotifReq};
 use libseccomp_sys::scmp_filter_ctx;
 
 use crate::{
-	AccessRequest, AccessRequestError, TurnstileTracerError,
-	fs::ForeignFd,
+	AccessRequestError, TurnstileTracerError,
+	access::{AccessRequest, fs::ForeignFd},
 	syscalls::{self, RequestContext},
 	utils::{unix_recv_fd, unix_send_fd},
 };
