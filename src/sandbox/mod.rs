@@ -171,6 +171,7 @@ fn validate_sandbox_path(path: &CStr) -> Result<(), BindMountSandboxError> {
 	Ok(())
 }
 
+/// Implements a basic bind-mount based sandbox.
 #[derive(Debug)]
 pub struct BindMountSandbox {
 	namespaces: ManagedNamespaces,
