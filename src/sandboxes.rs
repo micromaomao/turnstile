@@ -606,7 +606,7 @@ impl<'a, 'b> MountBuilder<'a, 'b> {
 
 fn restrict_self_impl<F: FnOnce() -> Result<(), std::io::Error>>(
 	nsenter_fn: F,
-	new_cwd_cstr: &CStr,
+	new_cwd_cstr: Option<&CStr>,
 ) -> Result<(), std::io::Error> {
 	match nsenter_fn() {
 		Ok(()) => (),
@@ -617,14 +617,16 @@ fn restrict_self_impl<F: FnOnce() -> Result<(), std::io::Error>>(
 			return Err(e);
 		}
 	}
-	unsafe {
-		let chdir = libc::chdir(new_cwd_cstr.as_ptr());
-		if chdir != 0 {
-			let err = perror!("chdir");
-			if ENABLE_LOG_IN_FORK {
-				error!("Failed to chdir to {:?}: errno {}", new_cwd_cstr, err);
+	if let Some(new_cwd_cstr) = new_cwd_cstr {
+		unsafe {
+			let chdir = libc::chdir(new_cwd_cstr.as_ptr());
+			if chdir != 0 {
+				let err = perror!("chdir");
+				if ENABLE_LOG_IN_FORK {
+					error!("Failed to chdir to {:?}: errno {}", new_cwd_cstr, err);
+				}
+				return Err(io::Error::from_raw_os_error(err));
 			}
-			return Err(io::Error::from_raw_os_error(err));
 		}
 	}
 	Ok(())
@@ -1276,10 +1278,7 @@ impl BindMountSandbox {
 	/// process contains more than one threads.
 	pub fn restrict_self(&self) -> Result<(), BindMountSandboxError> {
 		let nsenter_fn = unsafe { self.namespaces.nsenter_fn(true, true, true, true) };
-		let new_cwd = std::env::current_dir().map_err(BindMountSandboxError::Getcwd)?;
-		let new_cwd_cstr = std::ffi::CString::new(new_cwd.as_os_str().as_encoded_bytes())
-			.expect("current directory path contains NUL byte");
-		restrict_self_impl(nsenter_fn, &new_cwd_cstr).map_err(BindMountSandboxError::RestrictSelf)
+		restrict_self_impl(nsenter_fn, None).map_err(BindMountSandboxError::RestrictSelf)
 	}
 
 	/// Run a command within the sandbox.  Can be called more than once
@@ -1297,7 +1296,7 @@ impl BindMountSandbox {
 			.expect("current directory path contains NUL byte");
 		unsafe {
 			let nsenter_fn = self.namespaces.nsenter_fn(true, true, true, true);
-			cmd.pre_exec(move || restrict_self_impl(&nsenter_fn, &new_cwd_cstr))
+			cmd.pre_exec(move || restrict_self_impl(&nsenter_fn, Some(&new_cwd_cstr)))
 		};
 		let child = cmd.spawn().map_err(BindMountSandboxError::Spawn)?;
 		Ok(child)
