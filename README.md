@@ -17,10 +17,17 @@ what files are used by a program.
 
 ## Features
 
-- Supports most non-metadata fs accesses, including Unix socket connects
+### Tracer
+
+- Support most non-metadata fs accesses, including Unix socket connects
 - API is designed to be maximally data-preserving: files are identified by
   their original path as passed from the application, possibly with a dir
   fd for *at() operations.
+
+### Sandbox
+
+- Support dynamic manipulation of the sandbox's view of the filesystem
+  using bind mounts.
 
 ## Goals
 
