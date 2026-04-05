@@ -321,7 +321,7 @@ impl ManagedNamespaces {
 }
 
 #[derive(Debug)]
-pub struct MountObj(ForeignFd);
+struct MountObj(ForeignFd);
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MountAttributes {
@@ -461,10 +461,6 @@ impl MountObj {
 		}
 	}
 
-	/// When updating the attributes on an existing mount, pass in the
-	/// existing attributes to avoid EPERM errors caused by trying to
-	/// clear attributes that we didn't set ourselves (and thus have no
-	/// rights to clear).
 	pub fn setattr(
 		&self,
 		attrs: MountAttributes,
@@ -1013,7 +1009,10 @@ impl BindMountSandbox {
 	}
 
 	/// Update the attributes of an existing mount within the sandbox.
-	/// Symlinks are not followed.
+	/// Symlinks are not followed.  Caller should store and pass in the
+	/// existing attributes to avoid EPERM errors caused by trying to
+	/// clear attributes that we didn't previously set (and thus have no
+	/// rights to clear).
 	pub fn set_mount_attr(
 		&self,
 		ns_path: &CStr,
