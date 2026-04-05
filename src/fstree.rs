@@ -100,90 +100,6 @@ pub struct FsTree<T> {
 	root: FsTreeNode<T>,
 }
 
-enum EntryState<'a, T> {
-	Exist(&'a mut FsTreeNode<T>),
-	PlaceIn {
-		entry: hash_map::Entry<'a, OsString, FsTreeNode<T>>,
-	},
-	ParentMissing {
-		first_child_entry: hash_map::Entry<'a, OsString, FsTreeNode<T>>,
-		missing_path_afterwards: OsString,
-	},
-}
-
-pub struct Entry<'a, T> {
-	state: EntryState<'a, T>,
-	path: OsString,
-}
-
-impl<'a, T> Entry<'a, T> {
-	pub fn get_mut(&mut self) -> Option<&mut T> {
-		match &mut self.state {
-			EntryState::Exist(node) => Some(&mut node.target),
-			_ => None,
-		}
-	}
-
-	/// Get a mutable reference to the target of this entry, creating it
-	/// and any missing parents if necessary.
-	///
-	/// create_node and create_missing_parent are called with the full
-	/// path of the node to create (but without leading slash).
-	pub fn get_mut_or_insert_with<F1: FnOnce(&OsStr) -> T, F2: FnMut(&OsStr) -> T>(
-		self,
-		create_node: F1,
-		mut create_missing_parent: F2,
-	) -> &'a mut T {
-		debug_assert!(!self.path.as_bytes().starts_with(b"/"));
-		let mut create_node = Some(create_node);
-		match self.state {
-			EntryState::Exist(node) => &mut node.target,
-			EntryState::PlaceIn { entry } => {
-				let node = entry.or_insert_with(|| FsTreeNode {
-					target: create_node.take().unwrap()(&self.path),
-					children: HashMap::new(),
-				});
-				&mut node.target
-			}
-			EntryState::ParentMissing {
-				first_child_entry,
-				missing_path_afterwards,
-			} => {
-				let mut built_up_prefix = self.path;
-				let mut current = first_child_entry.or_insert_with_key(|k| {
-					if !built_up_prefix.is_empty() {
-						built_up_prefix.push(OsStr::new("/"));
-					}
-					built_up_prefix.push(k);
-					FsTreeNode {
-						target: create_missing_parent(&built_up_prefix),
-						children: HashMap::new(),
-					}
-				});
-				for comp in path_to_components(&missing_path_afterwards) {
-					built_up_prefix.push(OsStr::new("/"));
-					built_up_prefix.push(comp.name);
-					current = current
-						.children
-						.entry(comp.name.to_owned())
-						.or_insert_with(|| {
-							let target = if !comp.is_last() {
-								create_missing_parent(&built_up_prefix)
-							} else {
-								create_node.take().unwrap()(&built_up_prefix)
-							};
-							FsTreeNode {
-								target,
-								children: HashMap::new(),
-							}
-						});
-				}
-				&mut current.target
-			}
-		}
-	}
-}
-
 pub enum DiffTree<'a, T1, T2> {
 	Updated(&'a T1, &'a T2),
 	Added(&'a T2),
@@ -200,6 +116,7 @@ impl<T> FsTree<T> {
 		}
 	}
 
+	/// Returns the target at the exact path
 	pub fn get(&self, path: &OsStr) -> Option<&T> {
 		let mut current = &self.root;
 		for comp in path_to_components(path) {
@@ -212,6 +129,7 @@ impl<T> FsTree<T> {
 		Some(&current.target)
 	}
 
+	/// Returns a mutable reference to the target at the exact path
 	pub fn get_mut(&mut self, path: &OsStr) -> Option<&mut T> {
 		let mut current = &mut self.root;
 		for comp in path_to_components(path) {
@@ -224,232 +142,121 @@ impl<T> FsTree<T> {
 		Some(&mut current.target)
 	}
 
-	/// Return either the path's tree node itself, or the closest parent,
-	/// and its path.
-	pub fn find<'a>(&mut self, path: &'a OsStr) -> (&'a OsStr, &T) {
+	/// Return either the path's tree node itself if it matches some
+	/// predicate, or the closest parent matching the predicate (called on
+	/// all components).
+	pub fn find<'a, P: FnMut(&'a OsStr, &T) -> bool>(
+		&mut self,
+		path: &'a OsStr,
+		mut predicate: P,
+	) -> Option<(&'a OsStr, &T)> {
 		let mut current = &self.root;
+		let mut last_matching: Option<(&'a OsStr, &T)> = None;
+		if predicate(OsStr::new(""), &self.root.target) {
+			last_matching = Some((OsStr::new(""), &self.root.target));
+		}
 		for comp in path_to_components(path) {
 			if let Some(v) = current.children.get(comp.name) {
 				current = v;
-			} else {
-				return (comp.parent_path_from_root, &current.target);
-			}
-		}
-		(path, &current.target)
-	}
-
-	pub fn entry(&mut self, path: &OsStr) -> Entry<'_, T> {
-		let mut current = &mut self.root;
-		for comp in path_to_components(path) {
-			if current.children.contains_key(comp.name) {
-				current = current.children.get_mut(comp.name).unwrap();
-			} else {
-				let entry = current.children.entry(comp.name.to_owned());
-				if comp.is_last() {
-					return Entry {
-						state: EntryState::PlaceIn { entry },
-						path: comp.path_from_root.to_owned(),
-					};
-				} else {
-					return Entry {
-						state: EntryState::ParentMissing {
-							first_child_entry: entry,
-							missing_path_afterwards: comp.remaining.to_owned(),
-						},
-						path: comp.path_from_root.to_owned(),
-					};
+				if predicate(comp.path_from_root, &current.target) {
+					last_matching = Some((comp.path_from_root, &current.target));
 				}
+			} else {
+				return last_matching;
 			}
 		}
-		Entry {
-			state: EntryState::Exist(current),
-			path: path.to_owned(),
-		}
+		last_matching
 	}
 
-	/// Remove entries in the subtree rooted at path for which drain
-	/// returns true, including the path itself, except any parents of any
-	/// entries for which drain returns false are kept (and drain won't be
-	/// called).
-	///
-	/// If this is called on "/", the root itself is not drained, but its
-	/// children are.
-	pub fn drain_subtree_bottom_up<F: FnMut(&OsStr, &mut T) -> bool>(
+	/// Insert path, and all necessary parents, into this FsTree, using
+	/// the constructor to create new nodes.
+	pub fn insert<'a, F: FnMut(&'a OsStr) -> T>(
 		&mut self,
-		path: &OsStr,
-		mut drain: F,
-	) {
-		let mut current = &mut self.root;
-		fn helper<T, F: FnMut(&OsStr, &mut T) -> bool>(
-			current: &mut FsTreeNode<T>,
-			pathbuf: &mut Vec<u8>,
-			drain: &mut F,
-		) -> bool {
-			current.children.retain(|k, v| {
-				let orig_len = pathbuf.len();
-				if !pathbuf.is_empty() {
-					pathbuf.push(b'/');
-				}
-				pathbuf.extend_from_slice(k.as_bytes());
-				let res = helper(v, pathbuf, drain);
-				pathbuf.truncate(orig_len);
-				!res
-			});
-			let should_remove = drain(OsStr::from_bytes(pathbuf), &mut current.target);
-			should_remove
-		}
+		path: &'a OsStr,
+		mut constructor: F,
+	) -> &mut T {
+		let mut current: &mut FsTreeNode<T> = &mut self.root;
 		for comp in path_to_components(path) {
-			if current.children.contains_key(comp.name) {
-				if comp.is_last() {
-					// remove children of current/comp
-					let mut pathbuf = comp.path_from_root.as_bytes().to_vec();
-					let mut comp_entry = current.children.remove_entry(comp.name).unwrap();
-					if helper(&mut comp_entry.1, &mut pathbuf, &mut drain) {
-						// remove current/comp itself
-						let should_remove = drain(comp.path_from_root, &mut comp_entry.1.target);
-						if !should_remove {
-							current.children.insert(comp_entry.0, comp_entry.1);
-						}
-					}
-					return;
-				} else {
-					current = current.children.get_mut(comp.name).unwrap();
+			// the lifetime on HashMap::get_mut is too restrictive, so we
+			// have to use .entry() here.
+			let entry = current.children.entry(comp.name.to_owned());
+			match entry {
+				hash_map::Entry::Occupied(e) => {
+					current = e.into_mut();
 				}
+				hash_map::Entry::Vacant(e) => {
+					let new_node = constructor(comp.parent_path_from_root);
+					current = e.insert(FsTreeNode {
+						target: new_node,
+						children: HashMap::new(),
+					});
+				}
+			}
+		}
+		&mut current.target
+	}
+
+	/// Remove the path and everything under it from the tree.
+	pub fn remove(&mut self, path: &OsStr) {
+		let mut current = &mut self.root;
+		for comp in path_to_components(path) {
+			if comp.is_last() {
+				current.children.remove(comp.name);
+				return;
+			}
+			if let Some(v) = current.children.get_mut(comp.name) {
+				current = v;
 			} else {
-				// path doesn't exist, so nothing to drain
+				// not found
 				return;
 			}
 		}
-		// root (no components, or path was empty/"/")
-		helper(current, &mut Vec::new(), &mut drain);
+		// root
+		current.children.clear();
 	}
 
-	/// Given a subtree, if it is empty, call drain to decide if it should
-	/// be removed, and if yes, remove it and repeat this process on its
-	/// parent.  If the given subtree is not empty, this does nothing.
-	/// Returns whether any entry was removed.  Does nothing if given "/".
-	pub fn drain_parents<F: FnMut(&OsStr, &mut T) -> bool>(
-		&mut self,
-		path: &OsStr,
-		mut drain: F,
-	) -> bool {
-		let components: Vec<&OsStr> = path_to_components(path).map(|c| c.name).collect();
-
-		if components.is_empty() {
-			return false;
+	fn walk_impl<F: FnMut(&OsStr, &T)>(
+		&self,
+		mut f: F,
+		top_down: bool,
+		path: &mut Vec<u8>,
+		node: &FsTreeNode<T>,
+	) {
+		if top_down {
+			f(OsStr::from_bytes(path), &node.target);
 		}
-
-		let mut any_removed = false;
-
-		fn helper<T, F: FnMut(&OsStr, &mut T) -> bool>(
-			node: &mut FsTreeNode<T>,
-			components: &[&OsStr],
-			depth: usize,
-			path_buf: &mut Vec<u8>,
-			drain: &mut F,
-			any_removed: &mut bool,
-		) -> bool {
-			if depth == components.len() {
-				return node.children.is_empty();
+		#[cfg(debug_assertions)]
+		let mut sorted_vec = node.children.iter().collect::<Vec<_>>();
+		#[cfg(debug_assertions)]
+		sorted_vec.sort_unstable_by_key(|(k, _)| *k);
+		#[cfg(debug_assertions)]
+		let iter = sorted_vec.iter();
+		#[cfg(not(debug_assertions))]
+		let iter = node.children.iter();
+		for (comp, child) in iter {
+			let orig_path_len = path.len();
+			if !path.is_empty() {
+				path.push(b'/');
 			}
-
-			let comp_os = components[depth];
-
-			if !node.children.contains_key(comp_os) {
-				return false;
-			}
-
-			let orig_len = path_buf.len();
-			if !path_buf.is_empty() {
-				path_buf.push(b'/');
-			}
-			path_buf.extend_from_slice(comp_os.as_bytes());
-
-			let child = node.children.get_mut(comp_os).unwrap();
-			let should_remove = helper(child, components, depth + 1, path_buf, drain, any_removed);
-
-			if should_remove {
-				let child_key = comp_os.to_owned();
-				let mut child_node = node.children.remove(&child_key).unwrap();
-				if drain(OsStr::from_bytes(path_buf), &mut child_node.target) {
-					*any_removed = true;
-					path_buf.truncate(orig_len);
-					return node.children.is_empty();
-				} else {
-					node.children.insert(child_key, child_node);
-					path_buf.truncate(orig_len);
-					return false;
-				}
-			}
-
-			path_buf.truncate(orig_len);
-			false
+			path.extend_from_slice(comp.as_bytes());
+			self.walk_impl(&mut f, top_down, path, child);
+			path.truncate(orig_path_len);
 		}
-
-		helper(
-			&mut self.root,
-			&components,
-			0,
-			&mut Vec::new(),
-			&mut drain,
-			&mut any_removed,
-		);
-		any_removed
-	}
-
-	pub fn remove_assert_no_subtree(&mut self, path: &OsStr) {
-		self.drain_subtree_bottom_up(path, |p, _| {
-			if p != path {
-				panic!(
-					"FsTree: expected no subtree at {:?}, but reached {:?}",
-					path, p
-				);
-			}
-			true
-		});
-	}
-
-	pub fn remove_subtree(&mut self, path: &OsStr) {
-		self.drain_subtree_bottom_up(path, |_, _| true);
-	}
-
-	fn walk_impl<F: FnMut(&OsStr, &T)>(&self, mut f: F, top_down: bool) {
-		fn helper<T, F: FnMut(&OsStr, &T)>(
-			node: &FsTreeNode<T>,
-			path: &mut Vec<u8>,
-			f: &mut F,
-			top_down: bool,
-		) {
-			if top_down {
-				f(OsStr::from_bytes(path), &node.target);
-			}
-			let mut sorted_vec = node.children.iter().collect::<Vec<_>>();
-			sorted_vec.sort_unstable_by_key(|(k, _)| *k);
-			for (comp, child) in sorted_vec.into_iter() {
-				let orig_path_len = path.len();
-				if !path.is_empty() {
-					path.push(b'/');
-				}
-				path.extend_from_slice(comp.as_bytes());
-				helper(child, path, f, top_down);
-				path.truncate(orig_path_len);
-			}
-			if !top_down {
-				f(OsStr::from_bytes(path), &node.target);
-			}
+		if !top_down {
+			f(OsStr::from_bytes(path), &node.target);
 		}
-		let mut path = Vec::new();
-		helper(&self.root, &mut path, &mut f, top_down);
 	}
 
-	/// Walks the tree in top-down order, e.g. /, /foo, /foo/bar, /baz
+	/// Walks the tree in top-down order, e.g. /, /foo, /foo/bar, /baz.
+	/// Iteration order for entries of the same directory is arbitrary.
 	pub fn walk_top_down<F: FnMut(&OsStr, &T)>(&self, f: F) {
-		self.walk_impl(f, true);
+		self.walk_impl(f, true, &mut Vec::new(), &self.root);
 	}
 
-	/// Walks the tree in bottom-up order, e.g. /foo/bar, /foo, /baz, /
+	/// Walks the tree in bottom-up order, e.g. /foo/bar, /foo, /baz, /.
+	/// Iteration order for entries of the same directory is arbitrary.
 	pub fn walk_bottom_up<F: FnMut(&OsStr, &T)>(&self, f: F) {
-		self.walk_impl(f, false);
+		self.walk_impl(f, false, &mut Vec::new(), &self.root);
 	}
 
 	fn diff_impl<

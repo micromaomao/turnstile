@@ -963,9 +963,7 @@ impl ManagedBindMountSandbox {
 	) -> Result<(), BindMountSandboxError> {
 		let mut desired_tree = FsTree::new(None);
 		for (path, mnt) in desired_mounts {
-			let e = desired_tree
-				.entry(path)
-				.get_mut_or_insert_with(|_| None, |_| None);
+			let e = desired_tree.insert(path, |_| None);
 			*e = Some(mnt);
 		}
 		let mut new_tree_state = self.current_mount_tree.clone();
@@ -993,7 +991,7 @@ impl ManagedBindMountSandbox {
 							err = Some(e);
 							return;
 						}
-						new_tree_state.remove_assert_no_subtree(sandbox_path);
+						new_tree_state.remove(sandbox_path);
 					}
 					crate::fstree::DiffTree::Added(new) => {
 						if let Some(new) = new {
@@ -1005,9 +1003,7 @@ impl ManagedBindMountSandbox {
 								err = Some(e);
 								return;
 							}
-							*new_tree_state
-								.entry(sandbox_path)
-								.get_mut_or_insert_with(|_| None, |_| None) = Some(new.clone());
+							*new_tree_state.insert(sandbox_path, |_| None) = Some(new.clone());
 						} else {
 							// placeholder dir - might as well create now
 							if let Err(e) =
@@ -1016,9 +1012,7 @@ impl ManagedBindMountSandbox {
 								err = Some(e);
 								return;
 							}
-							new_tree_state
-								.entry(sandbox_path)
-								.get_mut_or_insert_with(|_| None, |_| None);
+							new_tree_state.insert(sandbox_path, |_| None);
 						}
 					}
 					crate::fstree::DiffTree::Updated(old, new) => match (old, new) {
