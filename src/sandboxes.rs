@@ -889,7 +889,7 @@ impl BindMountSandbox {
 					}
 					return Err(BindMountSandboxError::Symlinkat(err));
 				}
-				dbg!("Created symlink {:?} -> {:?} in sandbox", linkpath, target);
+				debug!("Created symlink {:?} -> {:?} in sandbox", linkpath, target);
 				return Ok(());
 			}
 		}
