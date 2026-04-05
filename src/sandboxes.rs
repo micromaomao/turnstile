@@ -863,6 +863,180 @@ impl BindMountSandbox {
 		}
 	}
 
+	/// Remove the given sandbox path from the backing tmpfs, removing
+	/// files within the pointed to directory recursively if it's a
+	/// directory.  Nothing is done if the path, or any of its parent
+	/// components, doesn't exist.
+	pub fn remove_placeholder(&self, path: &CStr) -> Result<(), BindMountSandboxError> {
+		if !path.to_bytes().starts_with(b"/") {
+			panic!("path must be absolute");
+		}
+
+		let bytes = path.to_bytes_with_nul();
+		let last_slash = bytes
+			.iter()
+			.rposition(|&b| b == b'/')
+			.expect("path is absolute so should have /");
+		let parent_path_buf;
+		let parent_path: &CStr = if last_slash == 0 {
+			c"/"
+		} else {
+			parent_path_buf = CString::new(&bytes[..last_slash]).unwrap();
+			&parent_path_buf
+		};
+		let leaf = CStr::from_bytes_with_nul(&bytes[last_slash + 1..]).unwrap();
+		if leaf.to_bytes().is_empty() {
+			panic!("cannot remove root");
+		}
+
+		// Open the parent directory in one shot
+		let parent_fd = unsafe {
+			let mut openhow: libc::open_how = mem::zeroed();
+			openhow.flags =
+				(libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY) as u64;
+			openhow.resolve = libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_IN_ROOT;
+			let fd = libc::syscall(
+				libc::SYS_openat2,
+				self.root_tmpfs.0.as_raw_fd(),
+				parent_path.as_ptr(),
+				&openhow as *const _,
+				std::mem::size_of::<libc::open_how>(),
+			) as libc::c_int;
+			if fd < 0 {
+				let err = io::Error::last_os_error();
+				if err.kind() == io::ErrorKind::NotFound {
+					return Ok(());
+				}
+				return Err(BindMountSandboxError::ResolveSandboxPath(err));
+			}
+			ForeignFd { local_fd: fd }
+		};
+
+		unsafe {
+			let mut stat: libc::stat = std::mem::zeroed();
+			if libc::fstatat(
+				parent_fd.as_raw_fd(),
+				leaf.as_ptr(),
+				&mut stat,
+				libc::AT_SYMLINK_NOFOLLOW,
+			) != 0
+			{
+				let err = io::Error::last_os_error();
+				return Err(BindMountSandboxError::StatSandboxPath(err));
+			}
+
+			if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+				self.remove_dir_recursive(parent_fd.as_raw_fd(), leaf)?;
+			} else {
+				let res = libc::unlinkat(parent_fd.as_raw_fd(), leaf.as_ptr(), 0);
+				if res != 0 {
+					let err = io::Error::last_os_error();
+					if err.kind() == io::ErrorKind::NotFound {
+						return Ok(());
+					}
+					return Err(BindMountSandboxError::RemoveSandboxPath(err));
+				}
+			}
+		}
+
+		debug!("Removed {:?} from sandbox tmpfs", path);
+		Ok(())
+	}
+
+	fn remove_dir_recursive(
+		&self,
+		parent_fd: libc::c_int,
+		name: &CStr,
+	) -> Result<(), BindMountSandboxError> {
+		unsafe {
+			let dir_fd = libc::openat(
+				parent_fd,
+				name.as_ptr(),
+				libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+			);
+			if dir_fd < 0 {
+				let err = io::Error::last_os_error();
+				if err.kind() == io::ErrorKind::NotFound {
+					return Ok(());
+				}
+				return Err(BindMountSandboxError::OpenSandboxDir(err));
+			}
+			// dup because fdopendir takes ownership
+			let dir_fd_dup = libc::fcntl(dir_fd, libc::F_DUPFD_CLOEXEC, 0);
+			if dir_fd_dup < 0 {
+				libc::close(dir_fd);
+				let err = io::Error::last_os_error();
+				return Err(BindMountSandboxError::OpenSandboxDir(err));
+			}
+
+			let dir = libc::fdopendir(dir_fd);
+			if dir.is_null() {
+				libc::close(dir_fd);
+				libc::close(dir_fd_dup);
+				let err = io::Error::last_os_error();
+				return Err(BindMountSandboxError::OpenSandboxDir(err));
+			}
+			// dir_fd is now owned by dir
+
+			loop {
+				*libc::__errno_location() = 0;
+				let entry = libc::readdir(dir);
+				if entry.is_null() {
+					let errno = *libc::__errno_location();
+					if errno != 0 {
+						libc::closedir(dir);
+						libc::close(dir_fd_dup);
+						return Err(BindMountSandboxError::OpenSandboxDir(
+							io::Error::from_raw_os_error(errno),
+						));
+					}
+					break;
+				}
+
+				let entry_name = CStr::from_ptr((*entry).d_name.as_ptr());
+				if entry_name == c"." || entry_name == c".." {
+					continue;
+				}
+
+				let mut stat: libc::stat = std::mem::zeroed();
+				if libc::fstatat(
+					dir_fd_dup,
+					entry_name.as_ptr(),
+					&mut stat,
+					libc::AT_SYMLINK_NOFOLLOW,
+				) != 0
+				{
+					let err = io::Error::last_os_error();
+					libc::closedir(dir);
+					libc::close(dir_fd_dup);
+					return Err(BindMountSandboxError::StatSandboxPath(err));
+				}
+
+				if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+					self.remove_dir_recursive(dir_fd_dup, entry_name)?;
+				} else {
+					let res = libc::unlinkat(dir_fd_dup, entry_name.as_ptr(), 0);
+					if res != 0 {
+						let err = io::Error::last_os_error();
+						libc::closedir(dir);
+						libc::close(dir_fd_dup);
+						return Err(BindMountSandboxError::RemoveSandboxPath(err));
+					}
+				}
+			}
+
+			libc::closedir(dir);
+			libc::close(dir_fd_dup);
+
+			let res = libc::unlinkat(parent_fd, name.as_ptr(), libc::AT_REMOVEDIR);
+			if res != 0 {
+				let err = io::Error::last_os_error();
+				return Err(BindMountSandboxError::RemoveSandboxPath(err));
+			}
+		}
+		Ok(())
+	}
+
 	// todo: the semantic of follow_ns_symlinks is ill-defined due to use
 	// of create_hierarchy, which has no visibility into bind-mounted
 	// symlinks

@@ -85,6 +85,8 @@ pub enum BindMountSandboxError {
 	MountFailed(libc::c_int),
 	#[error("Failed to open path within sandbox: {0}")]
 	ResolveSandboxPath(#[source] std::io::Error),
+	#[error("Failed to open directory within sandbox: {0}")]
+	OpenSandboxDir(#[source] std::io::Error),
 	#[error("Failed to open path on host: {0:?}: {1}")]
 	ResolveHostPath(CString, #[source] std::io::Error),
 	#[error("Failed to mkdir within sandbox: {0}")]
