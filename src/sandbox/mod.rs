@@ -1005,14 +1005,8 @@ impl ManagedBindMountSandbox {
 							}
 							*new_tree_state.insert(sandbox_path, |_| None) = Some(new.clone());
 						} else {
-							// placeholder dir - might as well create now
-							if let Err(e) =
-								self.sandbox.create_placeholder_hierarchy(&ns_path, true)
-							{
-								err = Some(e);
-								return;
-							}
-							new_tree_state.insert(sandbox_path, |_| None);
+							// placeholder dir - we will create it later
+							// when we walk to the mount
 						}
 					}
 					crate::fstree::DiffTree::Updated(old, new) => match (old, new) {
