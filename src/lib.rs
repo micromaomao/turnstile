@@ -10,13 +10,13 @@
 
 mod access;
 mod errors;
-mod sandboxes;
+mod sandbox;
 mod syscalls;
 mod tracer;
 mod utils;
 
 pub use crate::access::*;
 pub use crate::errors::*;
-pub use crate::sandboxes::*;
+pub use crate::sandbox::*;
 pub use crate::syscalls::RequestContext;
 pub use crate::tracer::*;
