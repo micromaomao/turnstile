@@ -23,7 +23,7 @@ struct Cli {
 	/// Block the sandboxed process from creating more unprivileged user
 	/// namespaces.
 	#[arg(long = "block-nested-userns")]
-	block_more_userns: bool,
+	block_nested_userns: bool,
 
 	/// Program to run and its arguments
 	#[arg(required = true)]
@@ -42,7 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	let cli = Cli::parse();
 
 	let context = Arc::new(Context {
-		sandbox: BindMountSandbox::new(cli.block_more_userns)?,
+		sandbox: BindMountSandbox::new(cli.block_nested_userns)?,
 		pidfd: OnceLock::new(),
 	});
 
