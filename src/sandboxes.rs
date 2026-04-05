@@ -922,12 +922,14 @@ impl BindMountSandbox {
 			));
 		}
 
-		// Open the parent directory in one shot
 		let parent_fd = unsafe {
 			let mut openhow: libc::open_how = mem::zeroed();
 			openhow.flags =
 				(libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY) as u64;
-			openhow.resolve = libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_IN_ROOT;
+			// RESOLVE_IN_ROOT and RESOLVE_NO_XDEV are not technically
+			// necessary in our setup, but adding for safety.
+			openhow.resolve =
+				libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_IN_ROOT | libc::RESOLVE_NO_XDEV;
 			let fd = libc::syscall(
 				libc::SYS_openat2,
 				self.root_tmpfs.0.as_raw_fd(),
@@ -985,11 +987,17 @@ impl BindMountSandbox {
 		name: &CStr,
 	) -> Result<(), BindMountSandboxError> {
 		unsafe {
-			let dir_fd = libc::openat(
+			let mut openhow: libc::open_how = mem::zeroed();
+			openhow.flags =
+				(libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) as u64;
+			openhow.resolve = libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_XDEV;
+			let dir_fd = libc::syscall(
+				libc::SYS_openat2,
 				parent_fd,
 				name.as_ptr(),
-				libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-			);
+				&openhow as *const _,
+				std::mem::size_of::<libc::open_how>(),
+			) as libc::c_int;
 			if dir_fd < 0 {
 				let err = io::Error::last_os_error();
 				if err.kind() == io::ErrorKind::NotFound {
@@ -1067,6 +1075,9 @@ impl BindMountSandbox {
 			let res = libc::unlinkat(parent_fd, name.as_ptr(), libc::AT_REMOVEDIR);
 			if res != 0 {
 				let err = io::Error::last_os_error();
+				if err.kind() == io::ErrorKind::NotFound {
+					return Ok(());
+				}
 				return Err(BindMountSandboxError::RemoveSandboxPath(err));
 			}
 		}
