@@ -955,6 +955,9 @@ impl BindMountSandbox {
 			) != 0
 			{
 				let err = io::Error::last_os_error();
+				if err.kind() == io::ErrorKind::NotFound {
+					return Ok(());
+				}
 				return Err(BindMountSandboxError::StatSandboxPath(err));
 			}
 
