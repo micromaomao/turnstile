@@ -309,6 +309,20 @@ impl<T> FsTree<T> {
 		current.children.clear();
 	}
 
+	/// Walks the tree in top-down order, e.g. /, /foo, /foo/bar, /baz,
+	/// calling the given function for any paths that exists in the tree.
+	/// Iteration order for entries of the same directory is arbitrary.
+	pub fn walk_top_down<F: FnMut(&OsStr, &T)>(&self, f: F) {
+		self.walk_impl(f, true, &mut Vec::new(), &self.root);
+	}
+
+	/// Walks the tree in bottom-up order, e.g. /foo/bar, /foo, /baz, /,
+	/// calling the given function for any paths that exists in the tree.
+	/// Iteration order for entries of the same directory is arbitrary.
+	pub fn walk_bottom_up<F: FnMut(&OsStr, &T)>(&self, f: F) {
+		self.walk_impl(f, false, &mut Vec::new(), &self.root);
+	}
+
 	/// path is a scratch buffer that this function can change, but must
 	/// restore to the original data on return.
 	fn walk_impl<F: FnMut(&OsStr, &T)>(
@@ -346,18 +360,59 @@ impl<T> FsTree<T> {
 		}
 	}
 
-	/// Walks the tree in top-down order, e.g. /, /foo, /foo/bar, /baz,
-	/// calling the given function for any paths that exists in the tree.
-	/// Iteration order for entries of the same directory is arbitrary.
-	pub fn walk_top_down<F: FnMut(&OsStr, &T)>(&self, f: F) {
-		self.walk_impl(f, true, &mut Vec::new(), &self.root);
-	}
-
-	/// Walks the tree in bottom-up order, e.g. /foo/bar, /foo, /baz, /,
-	/// calling the given function for any paths that exists in the tree.
-	/// Iteration order for entries of the same directory is arbitrary.
-	pub fn walk_bottom_up<F: FnMut(&OsStr, &T)>(&self, f: F) {
-		self.walk_impl(f, false, &mut Vec::new(), &self.root);
+	/// Produce the difference between two trees.  self is considered the
+	/// "old" tree and other is considered the "new" tree.  For entries
+	/// that are in both trees, if split_on returns true, they are
+	/// traversed separately (resulting in a [`DiffTree::Removed`] for
+	/// everything in the old tree and a [`DiffTree::Added`] for
+	/// everything in the new tree).  If split_on returns false, a
+	/// [`DiffTree::Updated`] is produced for both side, and the children
+	/// are traversed together.
+	///
+	/// For trees removed, the iteration order is bottom-up, e.g.
+	/// /foo/bar, /foo, /baz, /.  For trees added or updated, the
+	/// iteration order is top-down, e.g. /, /foo, /foo/bar.
+	///
+	/// `split_on_one_side` controls what happens when two trees have a
+	/// path in common, but the parent of the path only exists on one
+	/// side.  If `split_on_one_side` is false, a [`DiffTree::Added`] or
+	/// [`DiffTree::Removed`] is produced for the parent, but the common
+	/// children are still traversed together and may produce
+	/// [`DiffTree::Updated`] entries.  If `split_on_one_side` is true,
+	/// the two sides are treated as completely separate paths and no
+	/// [`DiffTree::Updated`] entries are produced for any children of the
+	/// parent in question,
+	pub fn diff<T2, F: FnMut(&OsStr, DiffTree<T, T2>), S: FnMut(&OsStr, &T, &T2) -> bool>(
+		&self,
+		other: &FsTree<T2>,
+		mut f: F,
+		mut split_on: S,
+		split_on_one_side: bool,
+	) {
+		self.diff_impl(
+			other,
+			|path, t1, t2| {
+				let diff = match (t1, t2) {
+					(Some(t1), Some(t2)) => DiffTree::Updated(t1, t2),
+					(Some(t1), None) => DiffTree::Removed(t1),
+					(None, Some(t2)) => DiffTree::Added(t2),
+					(None, None) => return,
+				};
+				f(path, diff);
+			},
+			|path, t1, t2| {
+				if let Some(t1) = t1
+					&& let Some(t2) = t2
+				{
+					split_on(path, t1, t2)
+				} else {
+					split_on_one_side
+				}
+			},
+			&mut Vec::new(),
+			&self.root,
+			&other.root,
+		);
 	}
 
 	/// path is a scratch buffer that this function can change, but must
@@ -463,61 +518,6 @@ impl<T> FsTree<T> {
 			);
 			path.truncate(orig_path_len);
 		}
-	}
-
-	/// Produce the difference between two trees.  self is considered the
-	/// "old" tree and other is considered the "new" tree.  For entries
-	/// that are in both trees, if split_on returns true, they are
-	/// traversed separately (resulting in a [`DiffTree::Removed`] for
-	/// everything in the old tree and a [`DiffTree::Added`] for
-	/// everything in the new tree).  If split_on returns false, a
-	/// [`DiffTree::Updated`] is produced for both side, and the children
-	/// are traversed together.
-	///
-	/// For trees removed, the iteration order is bottom-up, e.g.
-	/// /foo/bar, /foo, /baz, /.  For trees added or updated, the
-	/// iteration order is top-down, e.g. /, /foo, /foo/bar.
-	///
-	/// `split_on_one_side` controls what happens when two trees have a
-	/// path in common, but the parent of the path only exists on one
-	/// side.  If `split_on_one_side` is false, a [`DiffTree::Added`] or
-	/// [`DiffTree::Removed`] is produced for the parent, but the common
-	/// children are still traversed together and may produce
-	/// [`DiffTree::Updated`] entries.  If `split_on_one_side` is true,
-	/// the two sides are treated as completely separate paths and no
-	/// [`DiffTree::Updated`] entries are produced for any children of the
-	/// parent in question,
-	pub fn diff<T2, F: FnMut(&OsStr, DiffTree<T, T2>), S: FnMut(&OsStr, &T, &T2) -> bool>(
-		&self,
-		other: &FsTree<T2>,
-		mut f: F,
-		mut split_on: S,
-		split_on_one_side: bool,
-	) {
-		self.diff_impl(
-			other,
-			|path, t1, t2| {
-				let diff = match (t1, t2) {
-					(Some(t1), Some(t2)) => DiffTree::Updated(t1, t2),
-					(Some(t1), None) => DiffTree::Removed(t1),
-					(None, Some(t2)) => DiffTree::Added(t2),
-					(None, None) => return,
-				};
-				f(path, diff);
-			},
-			|path, t1, t2| {
-				if let Some(t1) = t1
-					&& let Some(t2) = t2
-				{
-					split_on(path, t1, t2)
-				} else {
-					split_on_one_side
-				}
-			},
-			&mut Vec::new(),
-			&self.root,
-			&other.root,
-		);
 	}
 }
 
