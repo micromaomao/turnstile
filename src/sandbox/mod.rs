@@ -1,8 +1,12 @@
 use std::{
 	borrow::Cow,
-	ffi::{CStr, CString},
+	ffi::{CStr, CString, OsStr},
 	io, mem,
-	os::{fd::AsRawFd, unix::process::CommandExt},
+	os::{
+		fd::{AsRawFd, IntoRawFd},
+		unix::{ffi::OsStrExt, process::CommandExt},
+	},
+	sync::Mutex,
 	thread,
 };
 
@@ -11,6 +15,7 @@ use log::{debug, error, info};
 use crate::{
 	BindMountSandboxError,
 	access::fs::ForeignFd,
+	fstree::FsTree,
 	utils::{fork_wait, unix_recv_fd, unix_send_fd},
 };
 
@@ -35,9 +40,11 @@ macro_rules! perror {
 
 mod mount_obj;
 mod namespace;
+mod utils;
 
 use mount_obj::MountObj;
 use namespace::ManagedNamespaces;
+use utils::{split_parent_leaf, validate_sandbox_path};
 
 fn write_to_path(path: &CStr, content: &str) -> libc::c_int {
 	unsafe {
@@ -73,7 +80,7 @@ fn write_to_path(path: &CStr, content: &str) -> libc::c_int {
 	}
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct MountAttributes {
 	pub readonly: bool,
 	pub noexec: bool,
@@ -120,57 +127,7 @@ impl std::fmt::Display for MountAttributes {
 	}
 }
 
-/// Split a validated absolute path into (parent, leaf).
-fn split_parent_leaf(path: &CStr) -> (CString, &CStr) {
-	let bytes = path.to_bytes_with_nul();
-	let last_slash = bytes
-		.iter()
-		.rposition(|&b| b == b'/')
-		.expect("path is absolute so should have /");
-	let parent = if last_slash == 0 {
-		CString::new("/").unwrap()
-	} else {
-		CString::new(&bytes[..last_slash]).unwrap()
-	};
-	let leaf = CStr::from_bytes_with_nul(&bytes[last_slash + 1..])
-		.expect("original path is nul-terminated");
-	(parent, leaf)
-}
-
-fn validate_sandbox_path(path: &CStr) -> Result<(), BindMountSandboxError> {
-	let bytes = path.to_bytes();
-	if !bytes.starts_with(b"/") {
-		return Err(BindMountSandboxError::InvalidSandboxPath(
-			"path must be absolute",
-			path.to_owned(),
-		));
-	}
-	if bytes == b"/" {
-		return Ok(());
-	}
-	if bytes.ends_with(b"/") {
-		return Err(BindMountSandboxError::InvalidSandboxPath(
-			"path must not have a trailing '/'",
-			path.to_owned(),
-		));
-	}
-	for component in bytes[1..].split(|&b| b == b'/') {
-		if component.is_empty() {
-			return Err(BindMountSandboxError::InvalidSandboxPath(
-				"path must not contain consecutive '/'",
-				path.to_owned(),
-			));
-		}
-		if component == b"." || component == b".." {
-			return Err(BindMountSandboxError::InvalidSandboxPath(
-				"path must not contain '.' or '..' components",
-				path.to_owned(),
-			));
-		}
-	}
-	Ok(())
-}
-
+/// Implements a basic bind-mount based sandbox.
 #[derive(Debug)]
 pub struct BindMountSandbox {
 	namespaces: ManagedNamespaces,
@@ -234,8 +191,8 @@ fn restrict_self_impl<F: FnOnce() -> Result<(), std::io::Error>>(
 	}
 	if let Some(new_cwd_cstr) = new_cwd_cstr {
 		unsafe {
-			let chdir = libc::chdir(new_cwd_cstr.as_ptr());
-			if chdir != 0 {
+			let res = libc::chdir(new_cwd_cstr.as_ptr());
+			if res != 0 {
 				let err = perror!("chdir");
 				if ENABLE_LOG_IN_FORK {
 					error!("Failed to chdir to {:?}: errno {}", new_cwd_cstr, err);
@@ -247,74 +204,92 @@ fn restrict_self_impl<F: FnOnce() -> Result<(), std::io::Error>>(
 	Ok(())
 }
 
+unsafe fn send_fd_from_ns<
+	F1: FnOnce() -> Result<(), std::io::Error> + Send,
+	F2: FnOnce() -> Result<libc::c_int, std::io::Error> + Send,
+	E: FnOnce(libc::c_int) -> BindMountSandboxError,
+>(
+	nsenter_fn: F1,
+	acquire_fd: F2,
+	map_err: E,
+) -> Result<libc::c_int, BindMountSandboxError> {
+	unsafe {
+		thread::scope(|s| {
+			let mut sock = [-1i32; 2];
+			let res = libc::socketpair(
+				libc::AF_UNIX,
+				libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+				0,
+				sock.as_mut_ptr(),
+			);
+			if res == -1 {
+				return Err(BindMountSandboxError::Socketpair(io::Error::last_os_error()));
+			}
+			let parent_sock = sock[0];
+			let child_sock = sock[1];
+
+			let jh = s.spawn(move || {
+				let recv_res = unix_recv_fd(parent_sock);
+				libc::close(parent_sock);
+				recv_res
+			});
+
+			let fork_res = fork_wait(|| {
+				libc::close(parent_sock);
+				match nsenter_fn() {
+					Ok(()) => (),
+					Err(e) => {
+						if ENABLE_LOG_IN_FORK {
+							error!("Failed to enter namespaces for mount: {}", e);
+						}
+						return e.raw_os_error().unwrap_or(libc::EIO);
+					}
+				}
+				let mut ret = 0;
+				match acquire_fd() {
+					Ok(fd) => {
+						if let Err(e) = unix_send_fd(child_sock, fd) {
+							if ENABLE_LOG_IN_FORK {
+								error!("Failed to send fd to parent: {}", e);
+							}
+							ret = e.raw_os_error().unwrap_or(libc::EIO)
+						}
+						libc::close(child_sock);
+						libc::close(fd);
+						ret
+					}
+					Err(e) => {
+						if ENABLE_LOG_IN_FORK {
+							error!("Failed to acquire fd in child: {}", e);
+						}
+						libc::close(child_sock);
+						e.raw_os_error().unwrap_or(libc::EIO)
+					}
+				}
+			})
+			.map_err(BindMountSandboxError::ForkError)?;
+			libc::close(child_sock);
+
+			if fork_res != 0 {
+				let _ = jh.join().expect("Child thread panicked");
+				return Err(map_err(fork_res));
+			}
+			jh.join()
+				.expect("Child thread panicked")
+				.map_err(BindMountSandboxError::ReceiveMountFd)
+		})
+	}
+}
+
 impl BindMountSandbox {
 	pub fn new(disable_userns: bool) -> Result<Self, BindMountSandboxError> {
 		let namespaces = ManagedNamespaces::new(disable_userns)?;
 		let root_tmpfs = unsafe {
-			MountObj::new_from_fd(thread::scope(
-				|s| -> Result<libc::c_int, BindMountSandboxError> {
-					let mut sock = [-1, -1];
-					let res = libc::socketpair(
-						libc::AF_UNIX,
-						libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
-						0,
-						sock.as_mut_ptr(),
-					);
-					if res == -1 {
-						return Err(BindMountSandboxError::Socketpair(io::Error::last_os_error()));
-					}
-					let parent_sock = sock[0];
-					let child_sock = sock[1];
-
-					let jh = s.spawn(move || -> Result<libc::c_int, BindMountSandboxError> {
-						let recv_res = unix_recv_fd(parent_sock);
-						libc::close(parent_sock);
-						recv_res.map_err(BindMountSandboxError::ReceiveMountFd)
-					});
-
-					let nsenter_fn = namespaces.nsenter_fn(true, true, false, false);
-					let fork_res = fork_wait(|| {
-						libc::close(parent_sock);
-						match nsenter_fn() {
-							Ok(()) => (),
-							Err(e) => {
-								if ENABLE_LOG_IN_FORK {
-									error!("Failed to enter namespaces for mount: {}", e);
-								}
-								return e.raw_os_error().unwrap_or(libc::EIO);
-							}
-						}
-						let ret = match MountObj::new_tmpfs() {
-							Ok(mnt) => {
-								let fd = mnt.0.as_raw_fd();
-								if let Err(e) = unix_send_fd(child_sock, fd) {
-									if ENABLE_LOG_IN_FORK {
-										error!("Failed to send mount fd to parent: {}", e);
-									}
-									return e.raw_os_error().unwrap_or(libc::EIO);
-								}
-								// fd will be closed by mnt's Drop
-								0
-							}
-							Err(e) => {
-								if ENABLE_LOG_IN_FORK {
-									error!("Failed to create tmpfs mount: {}", e);
-								}
-								e.raw_os_error().unwrap_or(libc::EIO)
-							}
-						};
-						libc::close(child_sock);
-						ret
-					})
-					.map_err(BindMountSandboxError::ForkError)?;
-					libc::close(child_sock);
-					if fork_res != 0 {
-						return Err(BindMountSandboxError::MakeDetachedTmpfsMountFailed(
-							fork_res,
-						));
-					}
-					jh.join().expect("Child thread panicked")
-				},
+			let nsenter_fn = namespaces.nsenter_fn(true, true, false, false);
+			MountObj::new_from_fd(send_fd_from_ns(
+				nsenter_fn,
+				|| MountObj::new_tmpfs().map(IntoRawFd::into_raw_fd),
+				BindMountSandboxError::MakeDetachedTmpfsMountFailed,
 			)?)
 		};
 		let s = Self {
@@ -744,11 +719,13 @@ impl BindMountSandbox {
 						return e.raw_os_error().unwrap_or(libc::EIO);
 					}
 				}
-				// We can't use host_fd here because it belongs to the
-				// host namespace, and will be rejected by open_tree().
-				// Let's open again.
+				// We can't use host_fd here because it was opened within
+				// the host namespace, and will be rejected by
+				// open_tree().  A mount namespace has its own set of
+				// mounts, let's open again within the mount namespace.
 				// TODO: ideally BindMountSandbox will save a fd to the
-				// m9's root so we can just do this outside.
+				// root opened when inside m0, so we can just do this
+				// outside.
 				let host_fd = libc::syscall(
 					libc::SYS_openat2,
 					libc::AT_FDCWD,
@@ -932,7 +909,7 @@ impl BindMountSandbox {
 					return perror!("open");
 				}
 				let mnt = MountObj::new_from_fd(fd);
-				match mnt.setattr(attrs, existing_attrs) {
+				match mnt.setattr(attrs, existing_attrs, 0) {
 					Ok(()) => 0,
 					Err(e) => e.raw_os_error().unwrap_or(libc::EIO),
 				}
@@ -980,41 +957,224 @@ impl BindMountSandbox {
 		let child = cmd.spawn().map_err(BindMountSandboxError::Spawn)?;
 		Ok(child)
 	}
+
+	pub fn root_in_sandbox(&self) -> Result<ForeignFd, BindMountSandboxError> {
+		unsafe {
+			let nsenter_fn = self.namespaces.nsenter_fn(true, true, true, true);
+			Ok(ForeignFd {
+				local_fd: send_fd_from_ns(
+					nsenter_fn,
+					|| {
+						let fd = libc::open(
+							c"/".as_ptr(),
+							libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+						);
+						if fd < 0 {
+							let err = perror!("Failed to open root in sandbox namespace");
+							return Err(io::Error::from_raw_os_error(err));
+						}
+						Ok(fd)
+					},
+					BindMountSandboxError::OpenRootInSandboxFailed,
+				)?,
+			})
+		}
+	}
 }
 
-#[cfg(test)]
-mod tests {
-	use super::*;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedMountPoint {
+	pub host_path: CString,
+	pub attrs: MountAttributes,
+}
 
-	#[test]
-	fn test_validate_sandbox_path() {
-		// Valid paths
-		assert!(validate_sandbox_path(c"/").is_ok());
-		assert!(validate_sandbox_path(c"/a").is_ok());
-		assert!(validate_sandbox_path(c"/a/b").is_ok());
-		assert!(validate_sandbox_path(c"/a/b/c").is_ok());
-		assert!(validate_sandbox_path(c"/usr/lib").is_ok());
+/// Implements a bind-mount based sandbox that automatically mount and
+/// unmounts based on a desired state.
+#[derive(Debug)]
+pub struct ManagedBindMountSandbox {
+	sandbox: BindMountSandbox,
+	current_mount_tree: Mutex<FsTree<ManagedMountPoint>>,
+}
 
-		// Not absolute
-		assert!(validate_sandbox_path(c"a").is_err());
-		assert!(validate_sandbox_path(c"a/b").is_err());
-		assert!(validate_sandbox_path(c"").is_err());
+impl ManagedBindMountSandbox {
+	pub fn new(disable_userns: bool) -> Result<Self, BindMountSandboxError> {
+		Ok(Self {
+			sandbox: BindMountSandbox::new(disable_userns)?,
+			current_mount_tree: Mutex::new(FsTree::new()),
+		})
+	}
 
-		// Trailing slash
-		assert!(validate_sandbox_path(c"/a/").is_err());
-		assert!(validate_sandbox_path(c"/a/b/").is_err());
+	pub fn add_or_update_mount(
+		&self,
+		path: &OsStr,
+		mp: ManagedMountPoint,
+	) -> Result<(), BindMountSandboxError> {
+		if path.as_encoded_bytes().contains(&0) {
+			return Err(BindMountSandboxError::InvalidSandboxPath(
+				"path contains NUL byte",
+				CString::from_vec_with_nul(format!("{:?}", path).into_bytes())
+					.expect("debug format should not contain NUL bytes"),
+			));
+		}
+		let mut mt = self
+			.current_mount_tree
+			.lock()
+			.expect("current_mount_tree lock poisoned");
+		let mut new_tree_state = mt.clone();
+		new_tree_state.insert(path, mp);
+		self.update_mounts_from_tree_impl(&mut mt, &new_tree_state)
+	}
 
-		// Consecutive slashes
-		assert!(validate_sandbox_path(c"//").is_err());
-		assert!(validate_sandbox_path(c"//a").is_err());
-		assert!(validate_sandbox_path(c"/a//b").is_err());
-		assert!(validate_sandbox_path(c"/a/b//").is_err());
+	pub fn remove_mount(&self, path: &OsStr) -> Result<(), BindMountSandboxError> {
+		if path.as_encoded_bytes().contains(&0) {
+			return Err(BindMountSandboxError::InvalidSandboxPath(
+				"path contains NUL byte",
+				CString::from_vec_with_nul(format!("{:?}", path).into_bytes())
+					.expect("debug format should not contain NUL bytes"),
+			));
+		}
+		let mut mt = self
+			.current_mount_tree
+			.lock()
+			.expect("current_mount_tree lock poisoned");
+		let mut new_tree_state = mt.clone();
+		new_tree_state.remove(path);
+		self.update_mounts_from_tree_impl(&mut mt, &new_tree_state)
+	}
 
-		// Dot components
-		assert!(validate_sandbox_path(c"/.").is_err());
-		assert!(validate_sandbox_path(c"/..").is_err());
-		assert!(validate_sandbox_path(c"/a/..").is_err());
-		assert!(validate_sandbox_path(c"/a/./b").is_err());
-		assert!(validate_sandbox_path(c"/a/../b").is_err());
+	pub fn update_mounts_from_tree(
+		&self,
+		desired_tree: &FsTree<ManagedMountPoint>,
+	) -> Result<(), BindMountSandboxError> {
+		let mut mt = self
+			.current_mount_tree
+			.lock()
+			.expect("current_mount_tree lock poisoned");
+		self.update_mounts_from_tree_impl(&mut mt, desired_tree)
+	}
+
+	pub fn update_mounts_from_list<'a>(
+		&self,
+		desired_mounts: impl IntoIterator<Item = (&'a OsStr, ManagedMountPoint)>,
+	) -> Result<(), BindMountSandboxError> {
+		let mut desired_tree = FsTree::new();
+		for (path, mnt) in desired_mounts {
+			if path.as_encoded_bytes().contains(&0) {
+				return Err(BindMountSandboxError::InvalidSandboxPath(
+					"path contains NUL byte",
+					CString::from_vec_with_nul(format!("{:?}", path).into_bytes())
+						.expect("debug format should not contain NUL byte"),
+				));
+			}
+			desired_tree.insert(path, mnt);
+		}
+		self.update_mounts_from_tree(&desired_tree)
+	}
+
+	fn update_mounts_from_tree_impl(
+		&self,
+		current_tree: &mut FsTree<ManagedMountPoint>,
+		desired_tree: &FsTree<ManagedMountPoint>,
+	) -> Result<(), BindMountSandboxError> {
+		let mut new_tree_state = current_tree.clone();
+		let mut err: Option<BindMountSandboxError> = None;
+		debug!("Current tree: {:?}", current_tree);
+		debug!("Desired tree: {:?}", desired_tree);
+		current_tree.diff(
+			&desired_tree,
+			|sandbox_path, diff| {
+				if err.is_some() {
+					return;
+				}
+				let ns_path = CString::new(sandbox_path.as_encoded_bytes())
+					.expect("caller should have checked for NUL bytes");
+				match diff {
+					crate::fstree::DiffTree::Removed(_) => {
+						if let Err(e) = self.sandbox.unmount(&ns_path) {
+							err = Some(e);
+							return;
+						}
+						new_tree_state.remove(sandbox_path);
+						if let Err(e) = self.sandbox.remove_placeholder(&ns_path) {
+							err = Some(e);
+							return;
+						}
+					}
+					crate::fstree::DiffTree::Added(new) => {
+						let mut b = self
+							.sandbox
+							.mount_host_into_sandbox(&new.host_path, &ns_path);
+						b.attributes(new.attrs);
+						if let Err(e) = b.mount() {
+							err = Some(e);
+							return;
+						}
+						new_tree_state.insert(sandbox_path, new.clone());
+					}
+					crate::fstree::DiffTree::Updated(old, new) => {
+						assert_eq!(old.host_path, new.host_path);
+						if old.attrs != new.attrs {
+							if let Err(e) =
+								self.sandbox.set_mount_attr(&ns_path, new.attrs, old.attrs)
+							{
+								err = Some(e);
+								return;
+							}
+							*new_tree_state
+								.get_mut(sandbox_path)
+								.expect("we must have it from before") = new.clone();
+						}
+					}
+				}
+			},
+			|_, old, new| old.host_path != new.host_path,
+			true,
+		);
+		*current_tree = new_tree_state;
+		match err {
+			Some(e) => Err(e),
+			None => Ok(()),
+		}
+	}
+
+	pub fn check_covered<'a>(
+		&self,
+		path: &CStr,
+		need_write: bool,
+		need_exec: bool,
+	) -> Result<(bool, Option<ManagedMountPoint>), BindMountSandboxError> {
+		validate_sandbox_path(path)?;
+		match self
+			.current_mount_tree
+			.lock()
+			.expect("current_mount_tree lock poisoned")
+			.find(OsStr::from_bytes(path.to_bytes()), |_, _| true)
+		{
+			None => return Ok((false, None)),
+			Some((_, mnt)) => {
+				if need_write && mnt.attrs.readonly {
+					return Ok((false, Some(mnt.clone())));
+				}
+				if need_exec && mnt.attrs.noexec {
+					return Ok((false, Some(mnt.clone())));
+				}
+				Ok((true, Some(mnt.clone())))
+			}
+		}
+	}
+
+	pub fn restrict_self(&self) -> Result<(), BindMountSandboxError> {
+		self.sandbox.restrict_self()
+	}
+
+	pub fn run_command(
+		&self,
+		cmd: &mut std::process::Command,
+	) -> Result<std::process::Child, BindMountSandboxError> {
+		self.sandbox.run_command(cmd)
+	}
+
+	pub fn root_in_sandbox(&self) -> Result<ForeignFd, BindMountSandboxError> {
+		self.sandbox.root_in_sandbox()
 	}
 }

@@ -81,6 +81,8 @@ pub enum BindMountSandboxError {
 	MakeDetachedTmpfsMountFailed(libc::c_int),
 	#[error("Failed to receive mount object fd from child: {0}")]
 	ReceiveMountFd(std::io::Error),
+	#[error("Failed to open root in sandbox namespace: errno {0}")]
+	OpenRootInSandboxFailed(libc::c_int),
 	#[error("mount failed: errno {0}")]
 	MountFailed(libc::c_int),
 	#[error("Failed to open path within sandbox: {0}")]
