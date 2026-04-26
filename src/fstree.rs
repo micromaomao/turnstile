@@ -179,6 +179,7 @@ struct FsTreeNode<T> {
 #[derive(Debug, Clone)]
 pub struct FsTree<T> {
 	root: FsTreeNode<T>,
+	nb_entries: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -206,6 +207,7 @@ impl<T> FsTree<T> {
 				data: None,
 				children: HashMap::new(),
 			},
+			nb_entries: 0,
 		}
 	}
 
@@ -235,6 +237,46 @@ impl<T> FsTree<T> {
 			}
 		}
 		current.data.as_mut()
+	}
+
+	/// Returns a mutable reference to the data at the exact path.  If the
+	/// path does not exist in the tree, `default_constructor` is called
+	/// and the return value is inserted then returned.
+	pub fn get_mut_or_insert<F: FnOnce() -> T>(
+		&mut self,
+		path: &OsStr,
+		default_constructor: F,
+	) -> &mut T {
+		let mut current = &mut self.root;
+		for comp in path_to_components(path) {
+			// the lifetime on HashMap::get_mut is too restrictive, so we
+			// have to use .entry() here.
+			let entry = current.children.entry(comp.name.to_owned());
+			match entry {
+				hash_map::Entry::Occupied(e) => {
+					current = e.into_mut();
+				}
+				hash_map::Entry::Vacant(e) => {
+					current = e.insert(FsTreeNode {
+						data: None,
+						children: HashMap::new(),
+					});
+				}
+			}
+		}
+		if current.data.is_none() {
+			current.data = Some(default_constructor());
+			self.nb_entries += 1;
+		}
+		current.data.as_mut().unwrap()
+	}
+
+	pub fn is_empty(&self) -> bool {
+		self.nb_entries == 0
+	}
+
+	pub fn len(&self) -> usize {
+		self.nb_entries
 	}
 
 	/// Attempt to walk from root to the given path, evaluating the
@@ -301,7 +343,11 @@ impl<T> FsTree<T> {
 				}
 			}
 		}
-		current.data.replace(target)
+		let ret = current.data.replace(target);
+		if ret.is_none() {
+			self.nb_entries += 1;
+		}
+		ret
 	}
 
 	/// Remove the path from the tree, returning the existing data, if
@@ -316,27 +362,11 @@ impl<T> FsTree<T> {
 				return None;
 			}
 		}
-		current.data.take()
-	}
-
-	/// Remove the path and everything under it from the tree.
-	pub fn remove_recursive(&mut self, path: &OsStr) {
-		let mut current = &mut self.root;
-		for comp in path_to_components(path) {
-			if comp.is_last() {
-				current.children.remove(comp.name);
-				return;
-			}
-			if let Some(v) = current.children.get_mut(comp.name) {
-				current = v;
-			} else {
-				// not found
-				return;
-			}
+		let ret = current.data.take();
+		if ret.is_some() {
+			self.nb_entries -= 1;
 		}
-		// root
-		current.data = None;
-		current.children.clear();
+		ret
 	}
 
 	/// Walks the tree in top-down order, e.g. /, /foo, /foo/bar, /baz,

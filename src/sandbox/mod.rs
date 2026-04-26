@@ -6,6 +6,7 @@ use std::{
 		fd::AsRawFd,
 		unix::{ffi::OsStrExt, process::CommandExt},
 	},
+	sync::Mutex,
 	thread,
 };
 
@@ -949,19 +950,19 @@ pub struct ManagedMountPoint {
 #[derive(Debug)]
 pub struct ManagedBindMountSandbox {
 	sandbox: BindMountSandbox,
-	current_mount_tree: FsTree<ManagedMountPoint>,
+	current_mount_tree: Mutex<FsTree<ManagedMountPoint>>,
 }
 
 impl ManagedBindMountSandbox {
 	pub fn new(disable_userns: bool) -> Result<Self, BindMountSandboxError> {
 		Ok(Self {
 			sandbox: BindMountSandbox::new(disable_userns)?,
-			current_mount_tree: FsTree::new(),
+			current_mount_tree: Mutex::new(FsTree::new()),
 		})
 	}
 
 	pub fn update_mounts<'a>(
-		&mut self,
+		&self,
 		desired_mounts: impl IntoIterator<Item = (&'a OsStr, ManagedMountPoint)>,
 	) -> Result<(), BindMountSandboxError> {
 		let mut desired_tree = FsTree::new();
@@ -975,9 +976,13 @@ impl ManagedBindMountSandbox {
 			}
 			desired_tree.insert(path, mnt);
 		}
-		let mut new_tree_state = self.current_mount_tree.clone();
+		let mut mt = self
+			.current_mount_tree
+			.lock()
+			.expect("current_mount_tree lock poisoned");
+		let mut new_tree_state = mt.clone();
 		let mut err: Option<BindMountSandboxError> = None;
-		self.current_mount_tree.diff(
+		mt.diff(
 			&desired_tree,
 			|sandbox_path, diff| {
 				if err.is_some() {
@@ -1025,7 +1030,7 @@ impl ManagedBindMountSandbox {
 			|_, old, new| old.host_path != new.host_path,
 			true,
 		);
-		self.current_mount_tree = new_tree_state;
+		*mt = new_tree_state;
 		match err {
 			Some(e) => Err(e),
 			None => Ok(()),
@@ -1041,6 +1046,8 @@ impl ManagedBindMountSandbox {
 		validate_sandbox_path(path)?;
 		match self
 			.current_mount_tree
+			.lock()
+			.expect("current_mount_tree lock poisoned")
 			.find(OsStr::from_bytes(path.to_bytes()), |_, _| true)
 		{
 			None => return Ok(false),

@@ -1,21 +1,30 @@
 use std::{
 	env,
-	ffi::{CStr, CString, OsString},
-	process::Command,
-	sync::{Arc, OnceLock},
+	ffi::{CStr, CString, OsStr, OsString},
+	fmt::write,
+	io::{self, Write},
+	os::unix::{ffi::OsStrExt, process::CommandExt},
+	path::PathBuf,
+	process::{Command, ExitStatus},
+	sync::{Arc, Mutex, OnceLock, atomic::AtomicBool},
 	thread::{self, sleep},
 	time::Duration,
 };
 
 use clap::Parser;
-use libturnstile::{BindMountSandbox, MountAttributes};
-use log::error;
+use libturnstile::{
+	AccessRequestError, BindMountSandbox, ManagedBindMountSandbox, MountAttributes,
+	TurnstileTracer,
+	access::{Operation, fs::FsOperation},
+	fstree::FsTree,
+};
+use log::{debug, error, info};
 
 use crate::common::{ProcPidFd, handle_child_result};
 
 mod common;
 
-/// Trace file operations of a program using libturnstile
+/// A simple interactive sandbox using libturnstile
 #[derive(Parser)]
 #[command(name = "turnstile-sandbox")]
 #[command(trailing_var_arg = true)]
@@ -25,15 +34,151 @@ struct Cli {
 	#[arg(long = "block-nested-userns")]
 	block_nested_userns: bool,
 
+	/// Configuration for this sandbox.  Changes to this file will be
+	/// live-reloaded.
+	#[arg(required = true)]
+	config: PathBuf,
+
 	/// Program to run and its arguments
 	#[arg(required = true)]
 	command: Vec<OsString>,
 }
 
+#[derive(Debug, Default)]
+struct DenialLogNode {
+	need_write: bool,
+	need_exec: bool,
+}
+
 #[derive(Debug)]
 struct Context {
-	sandbox: BindMountSandbox,
+	sandbox: ManagedBindMountSandbox,
+	tracer: TurnstileTracer,
 	pidfd: OnceLock<ProcPidFd>,
+	should_exit: AtomicBool,
+}
+
+fn tracing_thread(context: &'static Context) {
+	if let Err(e) = context.tracer.receive_notify_fd() {
+		error!("error receiving notify fd: {}", e);
+		std::process::exit(1);
+	}
+	let mut denials = FsTree::<DenialLogNode>::new();
+	loop {
+		if context
+			.should_exit
+			.load(std::sync::atomic::Ordering::Relaxed)
+		{
+			break;
+		}
+		match context.tracer.yield_request() {
+			Ok(Some((request, mut req_ctx))) => {
+				debug!("got request: {:?}", request);
+				let mut send_eperm = false;
+				match request.operation() {
+					Operation::FsOperation(fsop) => {
+						let rwxps = fsop.as_rwx_permissions();
+						for rwxp in rwxps {
+							let t_local = match rwxp.target.reopen_in_local_root() {
+								Ok(t) => t,
+								Err(e) => {
+									error!(
+										"error reopening target in real root for {}: {}",
+										rwxp, e
+									);
+									break;
+								}
+							};
+							let target_fd = if rwxp.is_dir_op {
+								t_local.open_target_dir().map(|x| x.0)
+							} else {
+								t_local.open_target()
+							};
+							if let Err(e) = target_fd {
+								error!("error opening target for {}: {}", rwxp, e);
+								break;
+							}
+							let abspath = match target_fd.unwrap().readlink() {
+								Ok(path) => {
+									let mut bytes = path.into_encoded_bytes();
+									bytes.push(b'\0');
+									CString::from_vec_with_nul(bytes).unwrap()
+								}
+								Err(e) => {
+									error!("error reading link for {}: {}", rwxp, e);
+									break;
+								}
+							};
+							match context
+								.sandbox
+								.check_covered(&abspath, rwxp.write, rwxp.exec)
+							{
+								Ok(true) => {}
+								Ok(false) => {
+									debug!("need fs permission {}", rwxp);
+									send_eperm = true;
+									let d = denials.get_mut_or_insert(
+										OsStr::from_bytes(abspath.as_bytes()),
+										DenialLogNode::default,
+									);
+									d.need_write |= rwxp.write;
+									d.need_exec |= rwxp.exec;
+								}
+								Err(e) => {
+									error!("error checking if {} is covered: {}", rwxp, e);
+								}
+							}
+						}
+					}
+					_ => {}
+				}
+				if send_eperm {
+					req_ctx.send_error(-libc::EPERM).unwrap_or_else(|e| {
+						error!("error sending EPERM: {}", e);
+					});
+				} else {
+					req_ctx.send_continue().unwrap_or_else(|e| {
+						error!("error continuing request: {}", e);
+					});
+				}
+			}
+			Ok(None) => {}
+			Err(e) => {
+				std::thread::sleep(Duration::from_millis(20));
+				if let Some(pidfd) = context.pidfd.get() {
+					match pidfd.is_alive() {
+						Ok(alive) => {
+							if !alive {
+								break;
+							}
+						}
+						Err(e) => {
+							error!("error checking if child process is alive: {}", e);
+						}
+					}
+				}
+				if let AccessRequestError::InvalidSyscallData(_) = e {
+					continue;
+				}
+				error!("yield_request: {}", e);
+			}
+		}
+	}
+	if !denials.is_empty() {
+		let mut stdout = std::io::stdout().lock();
+		write!(stdout, "Denials:\n").unwrap();
+		denials.walk_top_down(|path, val| {
+			write!(
+				stdout,
+				"  r{}{} {:?}\n",
+				if val.need_write { "w" } else { "-" },
+				if val.need_exec { "x" } else { "-" },
+				path
+			)
+			.unwrap();
+		});
+		stdout.flush().unwrap();
+	}
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -41,74 +186,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 	let cli = Cli::parse();
 
-	let context = Arc::new(Context {
-		sandbox: BindMountSandbox::new(cli.block_nested_userns)?,
+	let init_sandbox = ManagedBindMountSandbox::new(cli.block_nested_userns)?;
+
+	let context = Box::leak(Box::new(Context {
+		sandbox: init_sandbox,
+		tracer: TurnstileTracer::new()?,
 		pidfd: OnceLock::new(),
-	});
-
-	let sandbox = &context.sandbox;
-	let mount = |host_path: &CStr,
-	             sandbox_path: &CStr,
-	             attrs: MountAttributes|
-	 -> Result<(), libturnstile::BindMountSandboxError> {
-		let mut mount = sandbox.mount_host_into_sandbox(host_path, sandbox_path);
-		mount.attributes(attrs);
-		mount.mount()
-	};
-
-	mount(c"/usr", c"/usr", MountAttributes::rx())?;
-	mount(c"/bin", c"/bin", MountAttributes::rx())?;
-	mount(c"/lib", c"/lib", MountAttributes::rx())?;
-	if std::fs::exists("/lib64").unwrap_or(false) {
-		mount(c"/lib64", c"/lib64", MountAttributes::rx())?;
-	}
-	mount(c"/etc", c"/etc", MountAttributes::rx())?;
-	mount(c"/dev", c"/dev", MountAttributes::rwx())?;
-	mount(c"/proc", c"/proc", MountAttributes::rwx())?;
-	let pwd = std::env::current_dir()?
-		.into_os_string()
-		.into_encoded_bytes();
-	let pwd = CString::new(pwd).unwrap();
-	mount(&pwd, &pwd, MountAttributes::ro())?;
-	let sandbox_tmp = env::temp_dir().join("sandbox-tmp");
-	std::fs::create_dir_all(&sandbox_tmp)?;
-	let sandbox_tmp = CString::new(sandbox_tmp.into_os_string().into_encoded_bytes()).unwrap();
-	mount(&sandbox_tmp, c"/tmp", MountAttributes::rwx())?;
+		should_exit: AtomicBool::new(false),
+	}));
 
 	let program = &cli.command[0];
 	let args = &cli.command[1..];
 	let mut cmd = Command::new(program);
 	cmd.args(args);
-
-	let context_for_thread = context.clone();
-	thread::spawn(move || {
-		let context = context_for_thread;
-
-		eprintln!("In 10 seconds, will allow write access on {:?}", pwd);
-		sleep(Duration::from_secs(10));
-
-		eprintln!("Now allowing write access on {:?}", pwd);
-		if let Err(e) =
+	unsafe {
+		cmd.pre_exec(|| {
 			context
-				.sandbox
-				.set_mount_attr(&pwd, MountAttributes::rw(), MountAttributes::ro())
-		{
-			error!("Failed to set mount attributes: {e}");
-		}
-
-		eprintln!("Taking away write access in 10 seconds");
-		sleep(Duration::from_secs(10));
-
-		eprintln!("Now taking away write access on {:?}", pwd);
-		if let Err(e) =
+				.tracer
+				.install_filters(true)
+				.map_err(|e| io::ErrorKind::Other.into())
+		});
+	}
+	let tracing_thread = thread::spawn(|| tracing_thread(context));
+	let mut res = match context.sandbox.run_command(&mut cmd) {
+		Ok(child) => child,
+		Err(e) => {
+			error!("error running command: {}", e);
 			context
-				.sandbox
-				.set_mount_attr(&pwd, MountAttributes::ro(), MountAttributes::rw())
-		{
-			error!("Failed to set mount attributes: {e}");
+				.should_exit
+				.store(true, std::sync::atomic::Ordering::Relaxed);
+			tracing_thread.join().unwrap();
+			std::process::exit(1);
 		}
-	});
-
-	let child_result = sandbox.run_command(&mut cmd);
-	handle_child_result(child_result, &context.pidfd)
+	};
+	let child_pid = res.id();
+	info!("Spawned child process with pid {}", child_pid);
+	context.pidfd.set(ProcPidFd::from_pid(child_pid)?).unwrap();
+	let res = res.wait()?;
+	if res.success() {
+		info!("Child process exited successfully");
+	} else {
+		error!("Child process exited with error: {:?}", res);
+	}
+	context
+		.should_exit
+		.store(true, std::sync::atomic::Ordering::Relaxed);
+	tracing_thread.join().unwrap();
+	Ok(())
 }

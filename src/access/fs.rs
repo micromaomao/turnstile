@@ -246,6 +246,38 @@ impl FsTarget {
 		Ok(ForeignFd { local_fd: fd })
 	}
 
+	fn open_target_dfd_from_local_root(&self) -> Result<ForeignFd, io::Error> {
+		let mut target_dfd_realpath = self.dfd.readlink()?.into_encoded_bytes();
+		target_dfd_realpath.push(b'\0');
+		if target_dfd_realpath.first().copied() != Some(b'/') {
+			panic!("readlink of dfd did not return an absolute path");
+		}
+		let target_dfd_realpath = CString::from_vec_with_nul(target_dfd_realpath).unwrap();
+		let target_dfd_in_our_root = unsafe {
+			libc::openat(
+				libc::AT_FDCWD,
+				target_dfd_realpath.as_ptr(),
+				libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+				0,
+			)
+		};
+		if target_dfd_in_our_root < 0 {
+			return Err(io::Error::last_os_error());
+		}
+		let target_dfd_in_our_root = ForeignFd {
+			local_fd: target_dfd_in_our_root,
+		};
+		Ok(target_dfd_in_our_root)
+	}
+
+	pub fn reopen_in_local_root(&self) -> Result<Self, io::Error> {
+		Ok(Self {
+			dfd: self.open_target_dfd_from_local_root()?,
+			path: self.path.clone(),
+			no_follow: self.no_follow,
+		})
+	}
+
 	/// Opens the parent of the target path with O_PATH, and returns the
 	/// dir fd along with the final component of the path.  This requires
 	/// everything except the final component of the path to exist (which
