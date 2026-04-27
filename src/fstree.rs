@@ -537,6 +537,8 @@ impl<T> FsTree<T> {
 					&& let Some(t2) = t2
 				{
 					split_on(path, t1, t2)
+				} else if t1.is_none() && t2.is_none() {
+					false
 				} else {
 					split_on_one_side
 				}

@@ -1,4 +1,8 @@
-use std::{ffi::CStr, io, os::fd::AsRawFd};
+use std::{
+	ffi::CStr,
+	io,
+	os::fd::{AsRawFd, IntoRawFd},
+};
 
 use super::{ENABLE_LOG_IN_FORK, MountAttributes};
 use crate::access::fs::ForeignFd;
@@ -161,5 +165,11 @@ impl MountObj {
 			}
 		}
 		Ok(())
+	}
+}
+
+impl IntoRawFd for MountObj {
+	fn into_raw_fd(self) -> libc::c_int {
+		self.0.into_raw_fd()
 	}
 }

@@ -3,7 +3,10 @@ use std::{
 	ffi::{CStr, CString, OsStr, OsString},
 	fmt::write,
 	io::{self, Write},
-	os::unix::{ffi::OsStrExt, process::CommandExt},
+	os::{
+		fd::AsRawFd,
+		unix::{ffi::OsStrExt, process::CommandExt},
+	},
 	path::PathBuf,
 	process::{Command, ExitStatus},
 	sync::{Arc, Mutex, OnceLock, atomic::AtomicBool},
@@ -13,9 +16,12 @@ use std::{
 
 use clap::Parser;
 use libturnstile::{
-	AccessRequestError, BindMountSandbox, ManagedBindMountSandbox, MountAttributes,
-	TurnstileTracer,
-	access::{Operation, fs::FsOperation},
+	AccessRequestError, BindMountSandbox, ManagedBindMountSandbox, ManagedMountPoint,
+	MountAttributes, TurnstileTracer,
+	access::{
+		Operation,
+		fs::{FsOperation, RwxPermission},
+	},
 	fstree::FsTree,
 };
 use log::{debug, error, info};
@@ -39,6 +45,11 @@ struct Cli {
 	#[arg(required = true)]
 	config: PathBuf,
 
+	/// If set, the sandbox will log denials but always allow the
+	/// operation to continue.
+	#[arg(long = "permissive")]
+	permissive: bool,
+
 	/// Program to run and its arguments
 	#[arg(required = true)]
 	command: Vec<OsString>,
@@ -52,10 +63,16 @@ struct DenialLogNode {
 
 #[derive(Debug)]
 struct Context {
+	/// The sandbox used for running the target command.
 	sandbox: ManagedBindMountSandbox,
+	/// We resolve currently not-allowed paths in a separate sandbox that
+	/// will have / mounted to /, except where a host path is mounted to a
+	/// different location within the sandbox.
+	path_res_sandbox: ManagedBindMountSandbox,
 	tracer: TurnstileTracer,
 	pidfd: OnceLock<ProcPidFd>,
 	should_exit: AtomicBool,
+	permissive: bool,
 }
 
 fn tracing_thread(context: &'static Context) {
@@ -64,6 +81,13 @@ fn tracing_thread(context: &'static Context) {
 		std::process::exit(1);
 	}
 	let mut denials = FsTree::<DenialLogNode>::new();
+	let resolve_sandbox_root = match context.path_res_sandbox.root_in_sandbox() {
+		Ok(fd) => fd,
+		Err(e) => {
+			error!("error getting root in path resolution sandbox: {}", e);
+			std::process::exit(1);
+		}
+	};
 	loop {
 		if context
 			.should_exit
@@ -79,23 +103,24 @@ fn tracing_thread(context: &'static Context) {
 					Operation::FsOperation(fsop) => {
 						let rwxps = fsop.as_rwx_permissions();
 						for rwxp in rwxps {
-							let t_local = match rwxp.target.reopen_in_local_root() {
-								Ok(t) => t,
-								Err(e) => {
-									error!(
-										"error reopening target in real root for {}: {}",
-										rwxp, e
-									);
-									break;
-								}
-							};
+							let t_local =
+								match rwxp.target.in_root(resolve_sandbox_root.as_raw_fd()) {
+									Ok(t) => t,
+									Err(e) => {
+										error!(
+											"error reopening target dfd in real root for {}: {}",
+											rwxp, e
+										);
+										break;
+									}
+								};
 							let target_fd = if rwxp.is_dir_op {
 								t_local.open_target_dir().map(|x| x.0)
 							} else {
 								t_local.open_target()
 							};
 							if let Err(e) = target_fd {
-								error!("error opening target for {}: {}", rwxp, e);
+								error!("error opening target in real root for {}: {}", rwxp, e);
 								break;
 							}
 							let abspath = match target_fd.unwrap().readlink() {
@@ -113,16 +138,61 @@ fn tracing_thread(context: &'static Context) {
 								.sandbox
 								.check_covered(&abspath, rwxp.write, rwxp.exec)
 							{
-								Ok(true) => {}
-								Ok(false) => {
-									debug!("need fs permission {}", rwxp);
-									send_eperm = true;
+								Ok((true, _)) => {}
+								Ok((false, mut existing_mnt)) => {
+									debug!(
+										"need fs permission {}{}{} on {}",
+										if rwxp.read { "r" } else { "-" },
+										if rwxp.write { "w" } else { "-" },
+										if rwxp.exec { "x" } else { "-" },
+										t_local
+									);
 									let d = denials.get_mut_or_insert(
 										OsStr::from_bytes(abspath.as_bytes()),
 										DenialLogNode::default,
 									);
 									d.need_write |= rwxp.write;
 									d.need_exec |= rwxp.exec;
+									send_eperm = true;
+									if context.permissive {
+										send_eperm = false;
+										if abspath.as_bytes() == b"/" {
+											// TODO
+											debug!("skipping mount update on /");
+											break;
+										}
+										if let Some(mp) = &existing_mnt
+											&& mp.host_path != abspath
+										{
+											existing_mnt = None;
+										}
+										let mut mp =
+											existing_mnt.unwrap_or_else(|| ManagedMountPoint {
+												host_path: abspath.clone(),
+												attrs: MountAttributes {
+													readonly: true,
+													noexec: true,
+												},
+											});
+										if rwxp.write {
+											mp.attrs.readonly = false;
+										}
+										if rwxp.exec {
+											mp.attrs.noexec = false;
+										}
+										match context.sandbox.add_or_update_mount(
+											OsStr::from_bytes(abspath.as_bytes()),
+											mp,
+										) {
+											Ok(()) => {}
+											Err(e) => {
+												error!(
+													"error updating mount for {:?}: {}",
+													abspath, e
+												);
+											}
+										}
+									}
 								}
 								Err(e) => {
 									error!("error checking if {} is covered: {}", rwxp, e);
@@ -186,14 +256,82 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 	let cli = Cli::parse();
 
-	let init_sandbox = ManagedBindMountSandbox::new(cli.block_nested_userns)?;
+	let sandbox = ManagedBindMountSandbox::new(cli.block_nested_userns)?;
+	let path_res_sandbox = ManagedBindMountSandbox::new(true)?;
 
 	let context = Box::leak(Box::new(Context {
-		sandbox: init_sandbox,
+		sandbox,
+		path_res_sandbox,
 		tracer: TurnstileTracer::new()?,
 		pidfd: OnceLock::new(),
 		should_exit: AtomicBool::new(false),
+		permissive: cli.permissive,
 	}));
+
+	// todo: default for now
+	context.sandbox.update_mounts_from_list([
+		(
+			OsStr::new("/usr"),
+			ManagedMountPoint {
+				host_path: CString::new("/usr").unwrap(),
+				attrs: MountAttributes {
+					readonly: true,
+					noexec: false,
+				},
+			},
+		),
+		(
+			OsStr::new("/bin"),
+			ManagedMountPoint {
+				host_path: CString::new("/bin").unwrap(),
+				attrs: MountAttributes {
+					readonly: true,
+					noexec: false,
+				},
+			},
+		),
+		(
+			OsStr::new("/lib"),
+			ManagedMountPoint {
+				host_path: CString::new("/lib").unwrap(),
+				attrs: MountAttributes {
+					readonly: true,
+					noexec: false,
+				},
+			},
+		),
+		(
+			OsStr::new("/lib64"),
+			ManagedMountPoint {
+				host_path: CString::new("/lib64").unwrap(),
+				attrs: MountAttributes {
+					readonly: true,
+					noexec: false,
+				},
+			},
+		),
+		(
+			OsStr::new("/proc"),
+			ManagedMountPoint {
+				host_path: CString::new("/proc").unwrap(),
+				attrs: MountAttributes {
+					readonly: true,
+					noexec: true,
+				},
+			},
+		),
+	])?;
+
+	context.path_res_sandbox.update_mounts_from_list([(
+		OsStr::new("/"),
+		ManagedMountPoint {
+			host_path: CString::new("/").unwrap(),
+			attrs: MountAttributes {
+				readonly: true,
+				noexec: true,
+			},
+		},
+	)])?;
 
 	let program = &cli.command[0];
 	let args = &cli.command[1..];
